@@ -1,334 +1,310 @@
 import os
-import io
-import re
-import psutil
+import urllib.parse
 import logging
-import subprocess
+
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QTextEdit, QCheckBox, QFileDialog,
-    QGroupBox, QMessageBox
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
+    QPushButton, QTextEdit, QCheckBox, QFileDialog, QGroupBox, QMessageBox,
 )
 from PyQt5.QtGui import QTextCursor, QTextCharFormat, QColor, QFont
+
 from GAG_tools.config_manager import ConfigManager
-import urllib.parse
+from GAG_tools.gsv_backend import GsvBackend
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class ProcessOutputReader(QThread):
-    output_received = pyqtSignal(str, bool)  # text, is_progress_update
+class BackendStartThread(QThread):
+    finished_start = pyqtSignal(bool, str)
 
-    def __init__(self, process):
+    def __init__(self, backend):
         super().__init__()
-        self.process = process
-        self.is_running = True
+        self.backend = backend
 
     def run(self):
-        text_stream = io.TextIOWrapper(
-            self.process.stdout,
-            encoding='utf-8',
-            errors='replace',
-            line_buffering=True
-        )
-
-        progress_pattern = re.compile(r'^\r.*it/s\]|.*it/s\]')
-
-        while self.is_running and self.process:
-            try:
-                line = text_stream.readline()
-                if not line:
-                    if self.process.poll() is not None:
-                        break
-                    continue
-
-                line = line.rstrip()
-                is_progress = bool(progress_pattern.search(line))
-                self.output_received.emit(line, is_progress)
-
-            except UnicodeDecodeError:
-                # If UTF-8 fails, try GBK
-                text_stream = io.TextIOWrapper(
-                    self.process.stdout,
-                    encoding='gbk',
-                    errors='replace',
-                    line_buffering=True
-                )
-            except Exception as e:
-                self.output_received.emit(f'Error reading output: {str(e)}', False)
-
-    def stop(self):
-        self.is_running = False
+        try:
+            ok = self.backend.start(timeout=240)
+            self.finished_start.emit(ok, "" if ok else "backend did not become ready (see log)")
+        except Exception as e:  # noqa: BLE001
+            self.finished_start.emit(False, str(e))
 
 
 class APIManager(QWidget):
+    """gsv.cpp backend tab: launches the Python sidecar and gsv_server."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.last_was_progress = False
         self.config_manager = ConfigManager()
-        self.process = None
-        self.output_reader = None
+        self.backend = None
+        self.start_thread = None
         self.is_running = False
         self.initUI()
-
-        # Autostart if configured
-        if self.config_manager.get_value('autostart_api'):
+        if self.config_manager.get_value("autostart_api"):
             self.start_api()
 
+    # ---- UI -------------------------------------------------------------
     def initUI(self):
         self.setGeometry(100, 100, 800, 800)
         layout = QVBoxLayout(self)
 
-        # API URL Group
-        url_group = QGroupBox(self.tr("API 配置"))
-        url_layout = QVBoxLayout()
+        cfg = QGroupBox(self.tr("gsv.cpp backend"))
+        cfg_layout = QVBoxLayout()
 
-        # URL input
-        url_input_layout = QHBoxLayout()
-        url_label = QLabel(self.tr("API URL:"))
-        self.url_input = QLineEdit(self.config_manager.get_value('api_url'))
-        url_input_layout.addWidget(url_label)
-        url_input_layout.addWidget(self.url_input)
-        url_layout.addLayout(url_input_layout)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(self.tr("API URL:")))
+        self.url_input = QLineEdit(self.config_manager.get_value("api_url"))
+        row.addWidget(self.url_input)
+        cfg_layout.addLayout(row)
 
-        # Python path selection
-        python_path_layout = QHBoxLayout()
-        python_path_label = QLabel(self.tr("Python 环境:"))
-        self.python_path_input = QLineEdit(self.config_manager.get_value('python_path'))
-        self.python_path_input.setReadOnly(True)
-        python_path_button = QPushButton(self.tr("浏览"))
-        python_path_button.clicked.connect(self.browse_python_path)
-        python_path_layout.addWidget(python_path_label)
-        python_path_layout.addWidget(self.python_path_input)
-        python_path_layout.addWidget(python_path_button)
-        url_layout.addLayout(python_path_layout)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(self.tr("gsv_server:")))
+        self.server_input = QLineEdit(self.config_manager.get_value("gsv_server_path"))
+        row.addWidget(self.server_input)
+        btn = QPushButton(self.tr("Browse"))
+        btn.clicked.connect(self.browse_server)
+        row.addWidget(btn)
+        cfg_layout.addLayout(row)
 
-        # Autostart checkbox
-        self.autostart_checkbox = QCheckBox(self.tr("随软件启动API"))
-        self.autostart_checkbox.setChecked(self.config_manager.get_value('autostart_api'))
-        url_layout.addWidget(self.autostart_checkbox)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(self.tr("Models:")))
+        self.models_input = QLineEdit(self.config_manager.get_value("models_dir"))
+        row.addWidget(self.models_input)
+        btn = QPushButton(self.tr("Browse"))
+        btn.clicked.connect(self.browse_models)
+        row.addWidget(btn)
+        cfg_layout.addLayout(row)
 
-        url_group.setLayout(url_layout)
-        layout.addWidget(url_group)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(self.tr("Device:")))
+        self.device_combo = QComboBox()
+        self.device_combo.addItems(["vulkan", "cpu"])
+        self.device_combo.setCurrentText(self.config_manager.get_value("device") or "vulkan")
+        row.addWidget(self.device_combo)
+        row.addStretch(1)
+        cfg_layout.addLayout(row)
 
-        # Control buttons
-        control_layout = QHBoxLayout()
-        self.start_button = QPushButton(self.tr("启动 API"))
+        row = QHBoxLayout()
+        row.addWidget(QLabel(self.tr("Sidecar Python (optional):")))
+        self.sidecar_python_input = QLineEdit(self.config_manager.get_value("sidecar_python"))
+        row.addWidget(self.sidecar_python_input)
+        btn = QPushButton(self.tr("Browse"))
+        btn.clicked.connect(self.browse_sidecar_python)
+        row.addWidget(btn)
+        cfg_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel(self.tr("Frontend data:")))
+        self.data_input = QLineEdit(self.config_manager.get_value("sidecar_data_dir"))
+        row.addWidget(self.data_input)
+        btn = QPushButton(self.tr("Browse"))
+        btn.clicked.connect(self.browse_data_dir)
+        row.addWidget(btn)
+        cfg_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel(self.tr("Reference dirs:")))
+        self.allow_input = QLineEdit(self.config_manager.get_value("allow_dirs"))
+        self.allow_input.setToolTip(
+            self.tr("Directories the engine may read reference audio from, separated by ';'")
+        )
+        row.addWidget(self.allow_input)
+        cfg_layout.addLayout(row)
+
+        self.autostart_checkbox = QCheckBox(self.tr("Start backend with the GUI"))
+        self.autostart_checkbox.setChecked(self.config_manager.get_value("autostart_api"))
+        cfg_layout.addWidget(self.autostart_checkbox)
+
+        cfg.setLayout(cfg_layout)
+        layout.addWidget(cfg)
+
+        control = QHBoxLayout()
+        self.start_button = QPushButton(self.tr("Start"))
         self.start_button.setStyleSheet("min-height: 30px;")
-        self.stop_button = QPushButton(self.tr("停止 API"))
+        self.stop_button = QPushButton(self.tr("Stop"))
         self.stop_button.setStyleSheet("min-height: 30px;")
         self.start_button.clicked.connect(self.start_api)
         self.stop_button.clicked.connect(self.stop_api)
         self.stop_button.setEnabled(False)
-        control_layout.addWidget(self.start_button)
-        control_layout.addWidget(self.stop_button)
+        control.addWidget(self.start_button)
+        control.addWidget(self.stop_button)
+        layout.addLayout(control)
 
-        # Output console
-        output_label = QLabel(self.tr("控制台输出"))
-        layout.addWidget(output_label)
+        layout.addWidget(QLabel(self.tr("Backend log:")))
         self.output_console = QTextEdit()
         self.output_console.setReadOnly(True)
         self.output_console.setStyleSheet("""
-                QTextEdit {
-                    background-color: #1e1e1e;
-                    color: #ffffff;
-                    font-family: "Microsoft YaHei Mono", Consolas, Monaco, monospace;
-                }
-            """)
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #ffffff;
+                font-family: "Microsoft YaHei Mono", Consolas, Monaco, monospace;
+            }
+        """)
         layout.addWidget(self.output_console)
 
-        layout.addLayout(control_layout)
-
-    def process_inference_output(self, text, is_progress_update):
+    # ---- helpers --------------------------------------------------------
+    def update_output(self, text, color="white", bold=False):
         cursor = self.output_console.textCursor()
-        cursor.movePosition(QTextCursor.End)
-
-        if hasattr(self, 'last_was_progress'):
-            if not self.last_was_progress and is_progress_update:
-                pass
-            elif self.last_was_progress and not is_progress_update:
-                text = '\n' + text
-        self.last_was_progress = is_progress_update
-
-        if is_progress_update:
-            cursor.movePosition(QTextCursor.StartOfLine, QTextCursor.KeepAnchor)
-            cursor.removeSelectedText()
-            self.update_output(text, color='#ffa500', auto_newline=False)
-        else:
-            if "info:" in text.lower():
-                self.update_output(text, color='green')
-            elif "debug:" in text.lower():
-                self.update_output(text, color='#87CEEB')
-            elif "error:" in text.lower():
-                self.update_output(text, color='red')
-            elif "warning:" in text.lower():
-                self.update_output(text, color='yellow')
-            else:
-                self.update_output(text)
-
-    def update_output(self, text, color='white', bold=False, italic=False, auto_newline=True):
-        cursor = self.output_console.textCursor()
-        format = QTextCharFormat()
-        format.setForeground(QColor(color))
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
         if bold:
-            format.setFontWeight(QFont.Bold)
-        if italic:
-            format.setFontItalic(True)
+            fmt.setFontWeight(QFont.Bold)
         cursor.movePosition(QTextCursor.End)
-        cursor.insertText(text + ('\n' if auto_newline else ''), format)
+        cursor.insertText(text + "\n", fmt)
         self.output_console.setTextCursor(cursor)
         self.output_console.ensureCursorVisible()
 
-    def print_separator(self, char='-', count=50):
-        self.update_output(char * count)
+    def log(self, text):
+        color = "white"
+        low = text.lower()
+        if "error" in low:
+            color = "red"
+        elif "warning" in low:
+            color = "yellow"
+        elif "listening" in low or "ready" in low:
+            color = "green"
+        self.update_output(text, color)
 
-    def browse_python_path(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            self.tr("选择 Python Executable"),
-            os.path.dirname(self.python_path_input.text()),
-            "Python Executable (python.exe)"
+    def parse_url(self):
+        url = self.url_input.text().strip() or "http://127.0.0.1:9880"
+        if not url.startswith(("http://", "https://")):
+            url = "http://" + url
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 9880
+        return host, port
+
+    # ---- browse ---------------------------------------------------------
+    def browse_server(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, self.tr("Select gsv_server"), "", "gsv_server (gsv_server*);;All files (*)"
         )
-        if file_path:
-            self.python_path_input.setText(file_path)
-            self.config_manager.set_value('python_path', file_path)
+        if p:
+            self.server_input.setText(p)
+            self.config_manager.set_value("gsv_server_path", p)
+
+    def browse_models(self):
+        p = QFileDialog.getExistingDirectory(
+            self, self.tr("Select models directory"), self.models_input.text()
+        )
+        if p:
+            self.models_input.setText(p)
+            self.config_manager.set_value("models_dir", p)
+
+    def browse_sidecar_python(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, self.tr("Select Python"), "", "Python (python.exe python);;All files (*)"
+        )
+        if p:
+            self.sidecar_python_input.setText(p)
+            self.config_manager.set_value("sidecar_python", p)
+
+    def browse_data_dir(self):
+        p = QFileDialog.getExistingDirectory(
+            self, self.tr("Select frontend data directory"), self.data_input.text()
+        )
+        if p:
+            self.data_input.setText(p)
+            self.config_manager.set_value("sidecar_data_dir", p)
+
+    # ---- lifecycle ------------------------------------------------------
+    def find_sidecar_script(self):
+        models = self.models_input.text().strip()
+        roots = [os.getcwd()]
+        if models:
+            roots.append(os.path.dirname(models))
+        cands = []
+        for root in roots:
+            cands += [
+                os.path.join(root, "tools", "text_sidecar.py"),
+                os.path.join(root, "frontend", "text_sidecar.py"),
+                os.path.join(root, "runtime", "frontend", "text_sidecar.py"),
+            ]
+        for c in cands:
+            if os.path.exists(c):
+                return c
+        return ""
+
+    def build_backend(self):
+        host, port = self.parse_url()
+        allow = [d.strip() for d in self.allow_input.text().replace(",", ";").split(";") if d.strip()]
+        models = self.models_input.text().strip()
+        if not allow and models:
+            allow = [models]
+        return GsvBackend(
+            server_path=self.server_input.text().strip(),
+            models_dir=models,
+            device=self.device_combo.currentText(),
+            port=port,
+            allow_dirs=allow,
+            sidecar_python=self.sidecar_python_input.text().strip(),
+            sidecar_script=self.find_sidecar_script(),
+            sidecar_port=port + 2,
+            data_dir=self.data_input.text().strip(),
+            log=self.log,
+        )
+
+    def save_config(self):
+        self.config_manager.update_config(
+            {
+                "api_url": self.url_input.text(),
+                "gsv_server_path": self.server_input.text(),
+                "models_dir": self.models_input.text(),
+                "device": self.device_combo.currentText(),
+                "sidecar_python": self.sidecar_python_input.text(),
+                "sidecar_data_dir": self.data_input.text(),
+                "allow_dirs": self.allow_input.text(),
+                "autostart_api": self.autostart_checkbox.isChecked(),
+            }
+        )
 
     def start_api(self):
-        if self.is_running:
+        if self.is_running or self.start_thread:
             return
-
-        python_path = self.python_path_input.text()
-        self.config_manager.update_config({'api_url': self.url_input.text()})
+        self.save_config()
+        if not os.path.exists(self.server_input.text().strip()):
+            QMessageBox.warning(self, self.tr("Error"), self.tr("gsv_server not found"))
+            return
         self.output_console.clear()
-        if not os.path.exists(python_path):
-            QMessageBox.warning(
-                self,
-                self.tr("错误"),
-                self.tr("指定的Python环境不存在.")
+        self.update_output("Starting gsv.cpp backend...", color="#90EE90", bold=True)
+        self.backend = self.build_backend()
+        self.is_running = True
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.start_thread = BackendStartThread(self.backend)
+        self.start_thread.finished_start.connect(self.on_started)
+        self.start_thread.start()
+
+    def on_started(self, ok, msg):
+        self.start_thread = None
+        if ok:
+            self.update_output(
+                "Backend is ready: http://127.0.0.1:%d" % self.backend.port,
+                color="#90EE90",
+                bold=True,
             )
-            return
-
-        try:
-            api_url = self.config_manager.get_value('api_url', 'http://127.0.0.1:9880')
-            try:
-                if not api_url.startswith(('http://', 'https://')):
-                    api_url = 'http://' + api_url
-
-                parsed = urllib.parse.urlparse(api_url)
-                host = parsed.hostname or '127.0.0.1'
-                port = str(parsed.port) if parsed.port else '9880'
-            except Exception as e:
-                logger.warning(f"Failed to parse API URL {api_url}, using defaults: {e}")
-                host = '127.0.0.1'
-                port = '9880'
-
-            # Add Python directory to PATH
-            env = os.environ.copy()
-            python_dir = os.path.dirname(python_path)
-            env["PATH"] = python_dir + os.pathsep + env.get("PATH", "")
-
-            # Start the API process
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-            # Create process
-            self.process = subprocess.Popen(
-                [python_path, "api_v2.py", "-a", host, "-p", port],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env={**env, "PYTHONIOENCODING": "utf-8"},
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-                startupinfo=startupinfo
-            )
-
-            # Start output reader
-            self.output_reader = ProcessOutputReader(self.process)
-            self.output_reader.output_received.connect(self.process_inference_output)
-            self.output_reader.start()
-
-            self.is_running = True
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-
-            logger.info("API process started")
-            self.update_output("API process started...", color='#90EE90', bold=True)
-
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                self.tr("错误"),
-                self.tr("尝试启动API时出错: ") + str(e)
-            )
-            logger.error(f"Failed to start API process: {e}")
-
-    def stop_api(self):
-        if not self.is_running:
-            return
-
-        try:
-            self.terminate_process()
+        else:
             self.is_running = False
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
+            self.update_output("Backend failed: " + (msg or "unknown error"), color="red")
+            QMessageBox.critical(self, self.tr("Error"), msg or self.tr("backend start failed"))
 
-            if self.output_reader:
-                self.output_reader.stop()
-                self.output_reader = None
-
-            logger.info("API process stopped")
-            self.update_output("API process stopped.", color='#90EE90', bold=True)
-
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                self.tr("错误"),
-                self.tr("尝试停止API时出错: ") + str(e)
-            )
-            logger.error(f"Failed to stop API process: {e}")
-
-    def terminate_process(self):
-        logger.info("Terminating API process")
-        if self.process:
-            try:
-                parent = psutil.Process(self.process.pid)
-                children = parent.children(recursive=True)
-                for child in children:
-                    child.terminate()
-                parent.terminate()
-                gone, still_alive = psutil.wait_procs(children + [parent], timeout=5)
-                for p in still_alive:
-                    p.kill()
-            except psutil.NoSuchProcess:
-                pass
-            self.process = None
+    def stop_api(self):
+        if self.backend:
+            self.backend.stop()
+        self.backend = None
+        self.is_running = False
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.update_output("Backend stopped.", color="#90EE90", bold=True)
 
     def cleanup(self):
-        # Save current configuration
-        updates = {
-            'api_url': self.url_input.text(),
-            'autostart_api': self.autostart_checkbox.isChecked()
-        }
-        self.config_manager.update_config(updates)
-
-        # Stop API if running
+        self.save_config()
         if self.is_running:
             self.stop_api()
 
     def closeEvent(self, event):
         self.cleanup()
         super().closeEvent(event)
-
-
-# For testing purposes
-if __name__ == '__main__':
-    from PyQt5.QtWidgets import QApplication
-    import sys
-
-    app = QApplication(sys.argv)
-    window = APIManager()
-    window.show()
-    sys.exit(app.exec_())

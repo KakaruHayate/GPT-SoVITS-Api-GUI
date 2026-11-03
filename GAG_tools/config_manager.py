@@ -42,7 +42,12 @@ class ConfigManager:
 
             self._default_config = {
                 'api_url': 'http://127.0.0.1:9880',
-                'python_path': os.path.join('runtime', 'python.exe'),
+                'gsv_server_path': os.path.join('runtime', 'gsv', 'gsv_server.exe'),
+                'models_dir': os.path.join('runtime', 'models'),
+                'device': 'vulkan',
+                'sidecar_python': os.path.join('runtime', 'python', 'python.exe'),
+                'sidecar_data_dir': os.path.join('runtime', 'models', 'frontend'),
+                'allow_dirs': '',
                 'autostart_api': True,
                 'MAX_WAVE_DISPLAY_POINTS': 2500,
                 'language': 'auto',
