@@ -2,7 +2,7 @@ import os
 import urllib.parse
 import logging
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QPushButton, QTextEdit, QCheckBox, QFileDialog, QGroupBox, QMessageBox,
@@ -34,13 +34,18 @@ class BackendStartThread(QThread):
 class APIManager(QWidget):
     """gsv.cpp backend tab: launches the Python sidecar and gsv_server."""
 
+    # log() is called from the backend reader threads; never touch widgets from there.
+    log_signal = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.config_manager = ConfigManager()
         self.backend = None
         self.start_thread = None
+        self.starting = False
         self.is_running = False
         self.initUI()
+        self.log_signal.connect(self.update_output, Qt.QueuedConnection)
         if self.config_manager.get_value("autostart_api"):
             self.start_api()
 
@@ -144,7 +149,16 @@ class APIManager(QWidget):
         layout.addWidget(self.output_console)
 
     # ---- helpers --------------------------------------------------------
-    def update_output(self, text, color="white", bold=False):
+    def update_output(self, text, color=None, bold=False):
+        if color is None:
+            low = text.lower()
+            color = "white"
+            if "error" in low:
+                color = "red"
+            elif "warning" in low:
+                color = "yellow"
+            elif "listening" in low or "ready" in low:
+                color = "green"
         cursor = self.output_console.textCursor()
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(color))
@@ -156,15 +170,8 @@ class APIManager(QWidget):
         self.output_console.ensureCursorVisible()
 
     def log(self, text):
-        color = "white"
-        low = text.lower()
-        if "error" in low:
-            color = "red"
-        elif "warning" in low:
-            color = "yellow"
-        elif "listening" in low or "ready" in low:
-            color = "green"
-        self.update_output(text, color)
+        # Called from the sidecar/server reader threads: queue it to the GUI thread.
+        self.log_signal.emit(text)
 
     def parse_url(self):
         url = self.url_input.text().strip() or "http://127.0.0.1:9880"
@@ -260,7 +267,7 @@ class APIManager(QWidget):
         )
 
     def start_api(self):
-        if self.is_running or self.start_thread:
+        if self.is_running or self.starting:
             return
         self.save_config()
         if not os.path.exists(self.server_input.text().strip()):
@@ -270,14 +277,18 @@ class APIManager(QWidget):
         self.update_output("Starting gsv.cpp backend...", color="#90EE90", bold=True)
         self.backend = self.build_backend()
         self.is_running = True
+        self.starting = True
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.start_thread = BackendStartThread(self.backend)
         self.start_thread.finished_start.connect(self.on_started)
+        # Keep the QThread alive until it has really finished: deleting it from inside its own
+        # signal handler aborts with "QThread: Destroyed while thread is still running".
+        self.start_thread.finished.connect(self.start_thread.deleteLater)
         self.start_thread.start()
 
     def on_started(self, ok, msg):
-        self.start_thread = None
+        self.starting = False
         if ok:
             self.update_output(
                 "Backend is ready: http://127.0.0.1:%d" % self.backend.port,
@@ -292,6 +303,9 @@ class APIManager(QWidget):
             QMessageBox.critical(self, self.tr("Error"), msg or self.tr("backend start failed"))
 
     def stop_api(self):
+        if self.start_thread is not None and self.start_thread.isRunning():
+            self.start_thread.wait(5000)
+        self.starting = False
         if self.backend:
             self.backend.stop()
         self.backend = None
