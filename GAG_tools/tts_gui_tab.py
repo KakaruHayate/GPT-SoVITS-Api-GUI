@@ -313,8 +313,26 @@ class APICheckThread(QThread):
     def run(self):
         while self.should_continue:
             try:
-                response = requests.get(f"{self.url}/control")
-                if response.status_code == 400:  # API is ready
+                # gsv.cpp exposes /health ({"ok": true}); upstream api_v2 only has /control,
+                # which answers 400 for a bare GET and is what older clients probe for.
+                ready = False
+                try:
+                    r = requests.get(f"{self.url}/health", timeout=3)
+                    if r.status_code == 200:
+                        try:
+                            ready = bool(r.json().get("ok"))
+                        except Exception:
+                            ready = False
+                except Exception:
+                    ready = False
+                if not ready:
+                    try:
+                        r = requests.get(f"{self.url}/control", timeout=3)
+                        ready = r.status_code == 400
+                    except Exception:
+                        ready = False
+
+                if ready:
                     self.status_signal.emit(True, self.tr("API 就绪"))
                     if not self.continuous:
                         break
