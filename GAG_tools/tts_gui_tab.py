@@ -991,7 +991,46 @@ class TTSGUI(QMainWindow):
     def synthesis_error(self, error_message):
         self.synthesize_button.setEnabled(True)
         self.statusBar.showMessage(self.tr("合成失败!"))
-        QMessageBox.critical(self, self.tr("合成语音失败"), error_message)
+        msg = str(error_message)
+        if "not under an allowed directory" in msg:
+            ref = self.param_widgets["ref_audio_path"].text().strip()
+            ref_dir = os.path.dirname(ref) if ref else ""
+            if ref_dir:
+                answer = QMessageBox.question(
+                    self,
+                    self.tr("参考音频不在允许目录"),
+                    self.tr("引擎只能读取“允许目录”中的参考音频。\n\n"
+                            "是否把下面这个目录加入允许列表并重启后端？\n\n{}").format(ref_dir),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if answer == QMessageBox.Yes:
+                    self.allow_reference_dir(ref_dir)
+                    return
+        QMessageBox.critical(self, self.tr("合成语音失败"), msg)
+
+    def allow_reference_dir(self, path):
+        """Add `path` to the backend allow list and restart it so the next synth can read it."""
+        api = getattr(self.window(), "api_manager_tab", None)
+        if api is None:
+            QMessageBox.information(
+                self,
+                self.tr("提示"),
+                self.tr("请到 API 管理页把该目录加入 Reference dirs（分号分隔），然后 Stop → Start。"),
+            )
+            return
+        dirs = [d for d in api.allow_input.text().replace(",", ";").split(";") if d.strip()]
+        if path not in dirs:
+            dirs.append(path)
+        api.allow_input.setText(";".join(dirs))
+        api.save_config()
+        api.stop_api()
+        api.start_api()
+        QMessageBox.information(
+            self,
+            self.tr("已更新"),
+            self.tr("已把目录加入允许列表并重启后端；状态变为“API 就绪”后请再次点击“开始合成”。"),
+        )
 
     def setup_edit_actions(self):
         self.delete_button.setEnabled(False)
