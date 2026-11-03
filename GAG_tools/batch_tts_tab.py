@@ -543,47 +543,31 @@ class BatchTTS(QWidget):
             dir_name = os.path.basename(os.path.dirname(model_path))
             return dir_name in PROMPT_REQUIRED_VERSIONS
 
-        # Prepare request parameters
+        # Prepare request parameters (gsv.cpp V5: voice + steps + cache-dit)
         params = {
             'text': text,
             'text_lang': preset_config.get('text_lang', 'all_zh'),
             'ref_audio_path': preset_config.get('ref_audio_path', ''),
             'prompt_lang': preset_config.get('prompt_lang', 'all_zh'),
-            'prompt_text': '' if preset_config.get('no_prompt', False) and not is_prompt_required_model(preset_config.get('sovits_model')) else preset_config.get('prompt_text', ''),
-            'aux_ref_audio_paths': preset_config.get('aux_ref_audio_paths', []),
+            'prompt_text': preset_config.get('prompt_text', ''),
+            'voice': preset_config.get('voice', ''),
             'top_k': preset_config.get('top_k', 5),
             'top_p': preset_config.get('top_p', 1.0),
             'temperature': preset_config.get('temperature', 1.0),
             'text_split_method': preset_config.get('text_split_method', 'cut1'),
-            'batch_size': preset_config.get('batch_size', 1),
-            'batch_threshold': preset_config.get('batch_threshold', 0.75),
-            'split_bucket': preset_config.get('split_bucket', True),
             'speed_factor': preset_config.get('speed_factor', 1.0),
-            'streaming_mode': False,  # 强制关闭流式传输
             'seed': preset_config.get('seed', -1),
-            'parallel_infer': preset_config.get('parallel_infer', True),
             'repetition_penalty': preset_config.get('repetition_penalty', 1.35),
-            "sample_steps": preset_config.get('sample_steps', 32),
-            "super_sampling": preset_config.get('super_sampling', False),
+            'sample_steps': preset_config.get('sample_steps', 4),
+            'skip_first_step': preset_config.get('skip_first_step', 0),
+            'dbcache': preset_config.get('dbcache', 'auto') if preset_config.get('model_version', 'v5turbo') == 'v5dev' else 'off',
+            'streaming_mode': False,
         }
-
-        gpt_model = preset_config.get('gpt_model')
-        sovits_model = preset_config.get('sovits_model')
 
         for _ in range(3):  # Retry 3 times
             if not self.processing:
                 return None
             try:
-                if gpt_model != self.current_gpt:
-                    if gpt_model:
-                        requests.get(f"{base_url}/set_gpt_weights", params={'weights_path': gpt_model})
-                    self.current_gpt = gpt_model
-
-                if sovits_model != self.current_sovits:
-                    if sovits_model:
-                        requests.get(f"{base_url}/set_sovits_weights", params={'weights_path': sovits_model})
-                    self.current_sovits = sovits_model
-
                 response = requests.post(f"{base_url}/tts", json=params)
 
                 if response.status_code == 200:

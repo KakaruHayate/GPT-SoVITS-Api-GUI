@@ -248,6 +248,30 @@ class ModelSwitchThread(QThread):
                                     self.tr("{} 模型切换时发生错误:\n {}").format(self.model_type.upper(), str(e)))
 
 
+class VoiceListThread(QThread):
+    """Fetch the registered voices from gsv_server (GET /models)."""
+    voices_ready = pyqtSignal(list, str, str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url.rstrip('/')
+
+    def run(self):
+        try:
+            response = requests.get(f"{self.url}/models", timeout=5)
+            data = response.json()
+            voices = []
+            for v in data.get("voices", []) or []:
+                if isinstance(v, dict):
+                    voices.append(v.get("name") or v.get("voice") or "")
+                elif isinstance(v, str):
+                    voices.append(v)
+            voices = [v for v in voices if v]
+            self.voices_ready.emit(voices, data.get("current", ""), "")
+        except Exception as e:
+            self.voices_ready.emit([], "", str(e))
+
+
 class TTSThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
@@ -338,48 +362,18 @@ class TTSGUI(QMainWindow):
             'auto': self.tr('多语种混合'),
             'auto_yue': self.tr('多语种混合(粤)')
         }
-        self.SAMPLE_STEPS = {
-            4: '4',
-            8: '8',
-            16: '16',
-            32: '32',
-            64: '64',
-            128: '128'
+        # gsv.cpp V5: turbo = 4 steps (DMD), dev = 32 steps + cache-dit
+        self.V5_MODES = {
+            'v5turbo': self.tr('V5 Turbo (4 步)'),
+            'v5dev': self.tr('V5 Dev (32 步)'),
         }
-        self.GPT_DIRS = [
-            ('GPT_weights', 'v1'),
-            ('GPT_weights_v2', 'v2'),
-            ('GPT_weights_v2Pro', 'v2p'),
-            ('GPT_weights_v2ProPlus', 'v2pp'),
-            ('GPT_weights_v3', 'v3'),
-            ('GPT_weights_v4', 'v4')
-        ]
-        self.SOVITS_DIRS = [
-            ('SoVITS_weights', 'v1'),
-            ('SoVITS_weights_v2', 'v2'),
-            ('SoVITS_weights_v2Pro', 'v2p'),
-            ('SoVITS_weights_v2ProPlus', 'v2pp'),
-            ('SoVITS_weights_v3', 'v3'),
-            ('SoVITS_weights_v4', 'v4')
-        ]
-        self.MODEL_PARAM_RESTRICTIONS = {
-            'sovits': {
-                'v1': ['sample_steps', 'super_sampling'],
-                'v2': ['sample_steps', 'super_sampling'],
-                'v2p': ['sample_steps', 'super_sampling'],
-                'v2pp': ['sample_steps', 'super_sampling'],
-                'v3': ['aux_ref_audio_paths', 'no_prompt'],
-                'v4': ['aux_ref_audio_paths', 'no_prompt', 'super_sampling'],
-            },
-            'gpt': {
-                'v1': [],
-                'v2': [],
-                'v2p': [],
-                'v2pp': [],
-                'v3': [],
-                'v4': [],
-            }
+        self.SAMPLE_STEPS = {4: '4', 8: '8', 16: '16', 32: '32', 64: '64'}
+        self.CACHE_MODES = {
+            'off': self.tr('关闭'),
+            'auto': self.tr('自动'),
+            'f4': 'F4', 'f8': 'F8', 'f16': 'F16',
         }
+        self.DEFAULT_STEPS = {'v5turbo': 4, 'v5dev': 32}
         self.config_manager = ConfigManager()
         self.setup_cache_directory()
         self.current_audio_file = None
@@ -401,12 +395,6 @@ class TTSGUI(QMainWindow):
         self.api_check_delay_timer.setSingleShot(True)
         self.api_check_delay_timer.setInterval(800)
         self.api_check_delay_timer.timeout.connect(self.on_api_url_changed)
-        self.watcher = QFileSystemWatcher(self)
-        for dir_info in self.GPT_DIRS + self.SOVITS_DIRS:
-            dir_name = dir_info[0]
-            os.makedirs(dir_name, exist_ok=True)
-            self.watcher.addPath(dir_name)
-        self.watcher.directoryChanged.connect(self.update_model_lists)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setAutoFillBackground(True)
         self.setup_background()
@@ -444,13 +432,13 @@ class TTSGUI(QMainWindow):
         params_layout.addWidget(self.text_input)
         self.text_input.setPlaceholderText(
             self.tr("在这里输入需要合成的文本..."
-                    "\n\n使用方法：\n"
-                    "1.将本exe放入GPT-SoVITS-v2pro-20250604或更新的官方整合包下，双击启动，支持v1，v2，v2p，v2pp，v3，v4模型。\n"
-                    "2.将读取并使用GPT_weights，_v2，_v2Pro，_v2ProPlus，_v3, _v4与SoVITS_weights，_v2，_v2Pro，_v2ProPlus，_v3, _v4下的模型，请先完成训练获得模型。\n"
-                    "3.保存预设将保存当前所有合成参数设定，可视为一个说话人，后续可快速切换，亦可用于批量合成页面。\n"
-                    "4.默认使用整合包自带环境来调起并使用API，也可以在API管理页面自定义。\n"
-                    "\n此外，若无可用N卡并使用官方整合包，请在初次启动前修改GPT_SoVITS/configs/tts_infer.yaml中的device为cpu, is_half为false 以避免API启动失败。"
-                    "\n\nGitHub开源地址: https://github.com/AliceNavigator/GPT-SoVITS-Api-GUI           by  领航员未鸟\n")
+                    "\n\n使用方法（gsv.cpp 改版）：\n"
+                    "1.这是面向 gsv.cpp（C++/ggml Vulkan/CPU 推理引擎）的 GAG 改版，只支持 GPT-SoVITS V5：v5turbo（4 步）与 v5dev（32 步 + cache-dit）。\n"
+                    "2.引擎与模型由 API 管理页启动：选择 runtime/gsv/gsv_server.exe、models 目录和设备（vulkan/cpu）。模型是 GGUF，不再是 GPT_weights/SoVITS_weights 里的 ckpt/pth。\n"
+                    "3.本页只需选择音色（voice）与模型版本：turbo 用 4 步；dev 用 32 步并可选 cache-dit（跳步缓存，F4/F8/F16 越快越省显存）。\n"
+                    "4.参考音频必须是 3-10 秒的 wav，且位于 API 管理页“允许的参考音频目录”之内；参考音频文本为必填（V5 不支持无参考文本模式）。\n"
+                    "5.保存预设会记住当前参数（音色/版本/步数/cache 等），可用于快速切换和批量合成。\n"
+                    "\nGitHub: https://github.com/KakaruHayate/gsv.cpp    GAG 上游: https://github.com/AliceNavigator/GPT-SoVITS-Api-GUI\n")
         )
 
         # Create parameter input widgets
@@ -585,24 +573,30 @@ class TTSGUI(QMainWindow):
         preset_group.setLayout(preset_layout)
         top_row.addWidget(preset_group)
 
-        # Model Selection
-        model_group = QGroupBox(self.tr("模型选择"))
+        # Voice / model version (gsv.cpp: voices are registered GGUF model sets)
+        model_group = QGroupBox(self.tr("模型与音色"))
         model_layout = QFormLayout()
         model_layout.setSpacing(8)
 
-        # GPT model
-        self.gpt_combo = QComboBox()
-        self.gpt_combo.setMinimumWidth(175)
-        self.gpt_combo.activated.connect(self.update_model_lists)
-        self.gpt_combo.currentIndexChanged.connect(self.update_param_restrictions)
-        model_layout.addRow(self.tr("GPT 模型:"), self.gpt_combo)
+        voice_row = QWidget()
+        voice_layout = QHBoxLayout(voice_row)
+        voice_layout.setContentsMargins(0, 0, 0, 0)
+        voice_layout.setSpacing(4)
+        self.voice_combo = QComboBox()
+        self.voice_combo.setMinimumWidth(150)
+        voice_layout.addWidget(self.voice_combo)
+        self.refresh_voices_button = QPushButton(self.tr("刷新"))
+        self.refresh_voices_button.setFixedWidth(50)
+        self.refresh_voices_button.clicked.connect(self.refresh_voices)
+        voice_layout.addWidget(self.refresh_voices_button)
+        model_layout.addRow(self.tr("音色 (voice):"), voice_row)
 
-        # Sovits model
-        self.sovits_combo = QComboBox()
-        self.sovits_combo.setMinimumWidth(175)
-        self.sovits_combo.activated.connect(self.update_model_lists)
-        self.sovits_combo.currentIndexChanged.connect(self.update_param_restrictions)
-        model_layout.addRow(self.tr("SoVITS 模型:"), self.sovits_combo)
+        self.mode_combo = QComboBox()
+        for key, label in self.V5_MODES.items():
+            self.mode_combo.addItem(label, key)
+        self.mode_combo.setMinimumWidth(150)
+        self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+        model_layout.addRow(self.tr("模型版本:"), self.mode_combo)
 
         model_group.setLayout(model_layout)
         top_row.addWidget(model_group)
@@ -653,31 +647,10 @@ class TTSGUI(QMainWindow):
         ref_audio_layout.addWidget(ref_audio_button)
         lang_form.addRow(self.tr("参考音频:"), ref_audio_widget)
 
-        # Prompt text
-        prompt_widget = QWidget()
-        prompt_layout = QHBoxLayout(prompt_widget)
-        prompt_layout.setContentsMargins(0, 0, 0, 0)
-        prompt_layout.setSpacing(4)
+        # Prompt text (required by V5: no reference-text-free mode)
         self.param_widgets['prompt_text'] = QLineEdit()
-        self.param_widgets['prompt_text'].setPlaceholderText(self.tr("不填则视为使用无参考文本模式"))
-        self.param_widgets['no_prompt'] = QCheckBox(self.tr("无参  "))
-        prompt_layout.addWidget(self.param_widgets['prompt_text'])
-        prompt_layout.addWidget(self.param_widgets['no_prompt'])
-        lang_form.addRow(self.tr("参考音频文本:"), prompt_widget)
-
-        # Auxiliary reference audio
-        aux_ref_widget = QWidget()
-        aux_ref_layout = QHBoxLayout(aux_ref_widget)
-        aux_ref_layout.setContentsMargins(0, 0, 0, 0)
-        aux_ref_layout.setSpacing(4)
-        self.param_widgets['aux_ref_audio_paths'] = QLineEdit()
-        self.param_widgets['aux_ref_audio_paths'].setPlaceholderText(self.tr("(可选)以额外的多个音频平均融合音色"))
-        aux_ref_button = QPushButton(self.tr("浏览"))
-        aux_ref_button.setFixedWidth(60)
-        aux_ref_button.clicked.connect(lambda: self.browse_files('aux_ref_audio_paths'))
-        aux_ref_layout.addWidget(self.param_widgets['aux_ref_audio_paths'])
-        aux_ref_layout.addWidget(aux_ref_button)
-        lang_form.addRow(self.tr("辅助参考音频:"), aux_ref_widget)
+        self.param_widgets['prompt_text'].setPlaceholderText(self.tr("必填：参考音频对应的文本"))
+        lang_form.addRow(self.tr("参考音频文本:"), self.param_widgets['prompt_text'])
 
         lang_layout.addLayout(lang_form)
         lang_group.setLayout(lang_layout)
@@ -739,41 +712,36 @@ class TTSGUI(QMainWindow):
 
         # Checkbox options
         options_grid = QGridLayout()
-        self.param_widgets['parallel_infer'] = QCheckBox(self.tr("并行推理"))
-        self.param_widgets['split_bucket'] = QCheckBox(self.tr("数据分桶"))
-        self.param_widgets['super_sampling'] = QCheckBox(self.tr("音频超分"))
         self.param_widgets['sample_steps'] = QComboBox()
         for key, value in self.SAMPLE_STEPS.items():
             self.param_widgets['sample_steps'].addItem(value, key)
-        self.param_widgets['sample_steps'].setCurrentIndex(3)
+        self.param_widgets['sample_steps'].setCurrentIndex(0)   # 4 steps = v5turbo default
 
-        sample_steps_widget = QWidget()
-        sample_steps_layout = QHBoxLayout(sample_steps_widget)
-        sample_steps_layout.setContentsMargins(0, 0, 0, 0)
-        sample_steps_layout.addWidget(QLabel(self.tr("采样步数:")))
-        sample_steps_layout.addWidget(self.param_widgets['sample_steps'])
+        steps_widget = QWidget()
+        steps_layout = QHBoxLayout(steps_widget)
+        steps_layout.setContentsMargins(0, 0, 0, 0)
+        steps_layout.addWidget(QLabel(self.tr("采样步数:")))
+        steps_layout.addWidget(self.param_widgets['sample_steps'])
 
-        options_grid.addWidget(self.param_widgets['parallel_infer'], 0, 0)
-        options_grid.addWidget(sample_steps_widget, 0, 1)
-        options_grid.addWidget(self.param_widgets['split_bucket'], 1, 0)
-        options_grid.addWidget(self.param_widgets['super_sampling'], 1, 1)
+        # cache-dit: skip transformer steps on v5dev (off / auto / F4 / F8 / F16)
+        self.param_widgets['dbcache'] = QComboBox()
+        for key, label in self.CACHE_MODES.items():
+            self.param_widgets['dbcache'].addItem(label, key)
+        self.param_widgets['dbcache'].setCurrentText(self.tr('自动'))
+        cache_widget = QWidget()
+        cache_layout = QHBoxLayout(cache_widget)
+        cache_layout.setContentsMargins(0, 0, 0, 0)
+        cache_layout.addWidget(QLabel(self.tr("cache-dit:")))
+        cache_layout.addWidget(self.param_widgets['dbcache'])
+
+        # skip_first_step: skip the first AR step ("跳1步")
+        self.param_widgets['skip_first_step'] = QCheckBox(self.tr("跳过首步"))
+
+        options_grid.addWidget(steps_widget, 0, 0)
+        options_grid.addWidget(cache_widget, 0, 1)
+        options_grid.addWidget(self.param_widgets['skip_first_step'], 1, 0)
 
         gen_layout.addLayout(options_grid)
-
-        # Batch settings
-        batch_layout = QGridLayout()
-        self.param_widgets['batch_size'] = QSpinBox()
-        self.param_widgets['batch_size'].setRange(1, 1000)
-        self.param_widgets['batch_threshold'] = QDoubleSpinBox()
-        self.param_widgets['batch_threshold'].setRange(0, 1)
-        self.param_widgets['batch_threshold'].setSingleStep(0.05)
-
-        batch_layout.addWidget(QLabel(self.tr("批次大小:")), 0, 0)
-        batch_layout.addWidget(self.param_widgets['batch_size'], 0, 1)
-        batch_layout.addWidget(QLabel(self.tr("分批阈值:")), 0, 2)
-        batch_layout.addWidget(self.param_widgets['batch_threshold'], 0, 3)
-
-        gen_layout.addLayout(batch_layout)
 
         # # System monitoring
         # monitor_layout = QVBoxLayout()
@@ -906,130 +874,58 @@ class TTSGUI(QMainWindow):
     #         self.tr("{:.2f} GB / {:.2f} GB").format(memory_used_gb, memory_total_gb))
     #     self.memory_progress.setValue(int(memory_percent))
 
-    def get_model_version(self, model_type):
-        combo = self.gpt_combo if model_type == 'gpt' else self.sovits_combo
-        return combo.currentText().split('/')[0]
+    def get_model_version(self, model_type=None):
+        """V5 mode key ('v5turbo' / 'v5dev'); kept because presets and batch code ask for it."""
+        return self.mode_combo.currentData() or 'v5turbo'
 
     def update_param_restrictions(self):
-        sovits_ver = self.get_model_version('sovits')
-        gpt_ver = self.get_model_version('gpt')
+        # gsv.cpp has no per-version parameter matrix; cache-dit only makes sense with many steps
+        dev = self.get_model_version() == 'v5dev'
+        if 'dbcache' in self.param_widgets:
+            self.param_widgets['dbcache'].setEnabled(dev)
 
-        restricted_params = set(
-            self.MODEL_PARAM_RESTRICTIONS['sovits'].get(sovits_ver, []) +
-            self.MODEL_PARAM_RESTRICTIONS['gpt'].get(gpt_ver, [])
-        )
+    def on_mode_changed(self):
+        steps = self.DEFAULT_STEPS.get(self.get_model_version(), 4)
+        idx = self.param_widgets['sample_steps'].findData(steps)
+        if idx >= 0:
+            self.param_widgets['sample_steps'].setCurrentIndex(idx)
+        self.update_param_restrictions()
 
-        for param, widget in self.param_widgets.items():
-            widget.setEnabled(param not in restricted_params)
+    def refresh_voices(self):
+        """Ask gsv_server for its registered voices (GET /models)."""
+        if getattr(self, '_voice_thread', None) is not None and self._voice_thread.isRunning():
+            return
+        url = self.api_url_input.text().strip() or "http://127.0.0.1:9880"
+        self.refresh_voices_button.setEnabled(False)
+        thread = VoiceListThread(url)
+        thread.voices_ready.connect(self.on_voices_ready)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        self._voice_thread = thread
 
-    @staticmethod
-    def get_model_files(directory, extension):
-        if not os.path.exists(directory):
-            return []
-        return [f for f in os.listdir(directory) if f.endswith(extension)]
+    def on_voices_ready(self, voices, current, error):
+        self.refresh_voices_button.setEnabled(True)
+        if error:
+            self.statusBar.showMessage(self.tr("获取音色失败: ") + str(error), 5000)
+            if self.voice_combo.count() == 0:
+                self.voice_combo.addItem("default", "default")
+            return
+        prev = self.voice_combo.currentData()
+        self.voice_combo.clear()
+        for v in (voices or ["default"]):
+            self.voice_combo.addItem(v, v)
+        want = prev or current or "default"
+        idx = self.voice_combo.findData(want)
+        if idx >= 0:
+            self.voice_combo.setCurrentIndex(idx)
 
     def update_model_lists(self):
-        current_gpt = self.gpt_combo.currentData()
-        current_sovits = self.sovits_combo.currentData()
-
-        self.gpt_combo.clear()
-        gpt_models = []
-        for dir_name, version in self.GPT_DIRS:
-            models = self.get_model_files(dir_name, '.ckpt')
-            for model in models:
-                display_name = f"{version}/{model}"
-                full_path = os.path.join(dir_name, model)
-                gpt_models.append((display_name, full_path))
-
-        seen = set()
-        unique_models = []
-        for display, path in gpt_models:
-            if path not in seen:
-                seen.add(path)
-                unique_models.append((display, path))
-        unique_models.sort(key=lambda x: (x[0].split('/')[0], x[0].split('/')[1]))
-
-        for display, path in unique_models:
-            self.gpt_combo.addItem(display, path)
-
-        if current_gpt in seen:
-            index = self.gpt_combo.findData(current_gpt)
-            if index >= 0:
-                self.gpt_combo.setCurrentIndex(index)
-
-        self.sovits_combo.clear()
-        sovits_models = []
-        for dir_name, version in self.SOVITS_DIRS:
-            models = self.get_model_files(dir_name, '.pth')
-            for model in models:
-                display_name = f"{version}/{model}"
-                full_path = os.path.join(dir_name, model)
-                sovits_models.append((display_name, full_path))
-
-        seen_sovits = set()
-        unique_sovits = []
-        for display, path in sovits_models:
-            if path not in seen_sovits:
-                seen_sovits.add(path)
-                unique_sovits.append((display, path))
-        unique_sovits.sort(key=lambda x: (x[0].split('/')[0], x[0].split('/')[1]))
-
-        for display, path in unique_sovits:
-            self.sovits_combo.addItem(display, path)
-
-        if current_sovits in seen_sovits:
-            index = self.sovits_combo.findData(current_sovits)
-            if index >= 0:
-                self.sovits_combo.setCurrentIndex(index)
+        self.refresh_voices()
 
     def switch_models_and_synthesize(self):
-        gpt_model = self.gpt_combo.currentData()
-        sovits_model = self.sovits_combo.currentData()
-
-        self.gpt_switching = False
-        self.sovits_switching = False
-
+        # The voice travels inside the /tts payload; no separate weight-switch round trip.
         self.synthesize_button.setEnabled(False)
-
-        if gpt_model != self.current_gpt_model:
-            self.gpt_switching = True
-            self.gpt_switch_thread = ModelSwitchThread(self.api_url_input.text(), 'gpt', gpt_model)
-            self.gpt_switch_thread.switch_signal.connect(self.handle_switch_result)
-            self.gpt_switch_thread.start()
-
-        if sovits_model != self.current_sovits_model:
-            self.sovits_switching = True
-            self.sovits_switch_thread = ModelSwitchThread(self.api_url_input.text(), 'sovits', sovits_model)
-            self.sovits_switch_thread.switch_signal.connect(self.handle_switch_result)
-            self.sovits_switch_thread.start()
-
-        # If no models need to be switched
-        if not self.gpt_switching and not self.sovits_switching:
-            self.statusBar.showMessage(self.tr("未检测到模型变更"), 5000)
-            self.execute_synthesis()
-
-    def handle_switch_result(self, success, message):
-        if not success:
-            self.synthesis_pending = False
-            self.synthesize_button.setEnabled(True)
-            QMessageBox.warning(self, self.tr("模型切换时出错"), message)
-
-            if "GPT" in message:
-                self.gpt_switching = False
-            elif "SOVITS" in message:
-                self.sovits_switching = False
-        else:
-            self.statusBar.showMessage(message, 5000)
-            if "GPT" in message:
-                self.current_gpt_model = self.gpt_combo.currentData()
-                self.gpt_switching = False
-            elif "SOVITS" in message:
-                self.current_sovits_model = self.sovits_combo.currentData()
-                self.sovits_switching = False
-
-        # If all requested switches are complete and there is a pending synthesis task, execute synthesis
-        if not self.gpt_switching and not self.sovits_switching and self.synthesis_pending:
-            self.execute_synthesis()
+        self.execute_synthesis()
 
     def prepare_synthesis(self):
         if not self.text_input.toPlainText():
@@ -1361,15 +1257,18 @@ class TTSGUI(QMainWindow):
         presets = self.config_manager.get_value('presets', {})
         preset_data = presets.get(preset_name, {})
 
-        if 'gpt_model' in preset_data and preset_data['gpt_model']:
-            index = self.gpt_combo.findData(preset_data['gpt_model'])
+        if 'voice' in preset_data and preset_data['voice']:
+            index = self.voice_combo.findData(preset_data['voice'])
+            if index < 0:
+                self.voice_combo.addItem(preset_data['voice'], preset_data['voice'])
+                index = self.voice_combo.findData(preset_data['voice'])
             if index >= 0:
-                self.gpt_combo.setCurrentIndex(index)
+                self.voice_combo.setCurrentIndex(index)
 
-        if 'sovits_model' in preset_data and preset_data['sovits_model']:
-            index = self.sovits_combo.findData(preset_data['sovits_model'])
+        if 'model_version' in preset_data and preset_data['model_version']:
+            index = self.mode_combo.findData(preset_data['model_version'])
             if index >= 0:
-                self.sovits_combo.setCurrentIndex(index)
+                self.mode_combo.setCurrentIndex(index)
 
         for param, value in preset_data.items():
             if param in self.param_widgets:
@@ -1392,16 +1291,13 @@ class TTSGUI(QMainWindow):
         preset_name, ok = QInputDialog.getText(self, self.tr("保存预设"), self.tr("输入预设名:"))
         if ok and preset_name:
             preset_data = {
-                'gpt_model': self.gpt_combo.currentData(),
-                'sovits_model': self.sovits_combo.currentData(),
+                'voice': self.voice_combo.currentData(),
+                'model_version': self.mode_combo.currentData(),
             }
 
             for param, widget in self.param_widgets.items():
                 if isinstance(widget, QLineEdit):
-                    if param == 'aux_ref_audio_paths':
-                        value = widget.text().split(';') if widget.text() else []
-                    else:
-                        value = widget.text()
+                    value = widget.text()
                 elif isinstance(widget, QComboBox):
                     value = widget.currentData()
                 elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
@@ -1449,24 +1345,30 @@ class TTSGUI(QMainWindow):
     def get_current_parameters(self):
         params = {}
         params['text'] = self.text_input.toPlainText()
+        params['voice'] = self.voice_combo.currentData() or ""
+        params['sample_steps'] = self.param_widgets['sample_steps'].currentData()
+        # cache-dit only applies to the dev model; turbo ignores it anyway
+        if self.get_model_version() == 'v5dev':
+            params['dbcache'] = self.param_widgets['dbcache'].currentData() or 'auto'
+        else:
+            params['dbcache'] = 'off'
 
         for param, widget in self.param_widgets.items():
+            if param in ('sample_steps', 'dbcache'):
+                continue
             if isinstance(widget, QLineEdit):
-                if param == 'aux_ref_audio_paths':
-                    value = widget.text().split(';') if widget.text() else []
-                elif param == 'prompt_text' and self.param_widgets['no_prompt'].isChecked() and self.get_model_version('sovits') not in {'v3', 'v4'}:
-                    value = ""
-                else:
-                    value = widget.text()
+                value = widget.text()
             elif isinstance(widget, QComboBox):
-                value = widget.currentData()  # Get current item's data (key)
+                value = widget.currentData()
             elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
                 value = widget.value()
             elif isinstance(widget, QCheckBox):
-                if param == 'no_prompt':
-                    continue
+                if param == 'skip_first_step':
+                    value = 1 if widget.isChecked() else 0
                 else:
                     value = widget.isChecked()
+            else:
+                continue
             params[param] = value
 
         return params
