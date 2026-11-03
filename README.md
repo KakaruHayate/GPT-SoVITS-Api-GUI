@@ -4,6 +4,15 @@ GAG is an inference GUI for GPT-SoVITS. This fork drives **[gsv.cpp](https://git
 instead of the upstream Python API: the API tab launches `gsv_server` (and, when configured, the
 Python text sidecar), and the rest of the GUI talks to the same api_v2-compatible HTTP service.
 
+## 仅支持 GPT-SoVITS V5（gsv.cpp 改版）
+
+本改版只面向 **gsv.cpp** 的 V5 模型：5turbo（4 步）和 5dev（32 步 + cache-dit）。
+界面按引擎实际支持的参数裁剪，不再有 v1/v2/v3/v4 的 ckpt/pth 模型选择、并行推理、数据分桶、
+音频超分、辅助参考音频等入口。可用参数：音色（voice）、采样步数、cache-dit（跳步缓存）、
+跳过首步（skip_first_step）、top_k/top_p/temperature、语速、种子、重复惩罚、文本分割方式。
+
+参考音频必须 3-10 秒且位于 API 管理页允许的目录内；参考文本必填（V5 不支持无参考文本模式）。
+
 ## Running with gsv.cpp
 
 1. Put the GUI next to a gsv.cpp runtime, e.g.
