@@ -207,17 +207,9 @@ class GsvBackend:
                     if not self.wait_sidecar(min(120.0, timeout)):
                         self.log("[gsv] warning: sidecar did not become ready")
         self.log("[gsv] server: %s" % " ".join(self.server_cmd()))
-        self.server = _spawn(self.server_cmd(), env=self.server_env())
+        self.server = _spawn(self.server_cmd())
         self._attach_reader(self.server, "server")
         return self.wait_health(timeout)
-
-    def server_env(self):
-        """ggml-vulkan reads GGML_VK_DISABLE_COOPMAT2 at static-init time; on NVIDIA the AR
-        logits lose precision with coopmat2 (see the engine warning), and AR is cheap anyway."""
-        env = os.environ.copy()
-        if self.device.startswith("vulkan"):
-            env.setdefault("GGML_VK_DISABLE_COOPMAT2", "1")
-        return env
 
     def sidecar_up(self):
         url = "http://127.0.0.1:%d/health" % self.sidecar_port
