@@ -152,6 +152,7 @@ class GsvBackend:
                 ("GSV_G2PW_MODEL", "g2pw"),
                 ("GSV_BERT_DIR", "bert_tokenizer"),
                 ("NLTK_DATA", "nltk_data"),
+                ("GSV_FAST_LANGDETECT", "fast_langdetect"),
             ):
                 for base in (self.data_dir, parent):
                     path = os.path.abspath(os.path.join(base, sub))

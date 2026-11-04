@@ -172,6 +172,9 @@ class APIManager(QWidget):
 
     def log(self, text):
         # Called from the sidecar/server reader threads: queue it to the GUI thread.
+        # Health polls fire every couple of seconds and would drown everything else.
+        if "/health" in text:
+            return
         self.log_signal.emit(text)
 
     def parse_url(self):
