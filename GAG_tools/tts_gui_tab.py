@@ -554,8 +554,9 @@ class TTSGUI(QMainWindow):
         # Update model lists
         self.update_model_lists()
 
-        # Load preset
+        # Load preset, then normalise the mode-dependent controls (turbo => cache-dit off)
         self.load_preset()
+        self.on_mode_changed()
 
         # Sets the translucent GroupBox style
         self.setup_group_box_styles()
