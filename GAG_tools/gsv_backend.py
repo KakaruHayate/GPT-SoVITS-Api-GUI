@@ -78,14 +78,17 @@ class GsvBackend:
         env = os.environ.copy()
         env.setdefault("PYTHONIOENCODING", "utf-8")
         if self.data_dir:
+            parent = os.path.dirname(os.path.abspath(self.data_dir))
             for key, sub in (
                 ("GSV_G2PW_MODEL", "g2pw"),
                 ("GSV_BERT_DIR", "bert_tokenizer"),
                 ("NLTK_DATA", "nltk_data"),
             ):
-                path = os.path.abspath(os.path.join(self.data_dir, sub))
-                if os.path.isdir(path):
-                    env[key] = path
+                for base in (self.data_dir, parent):
+                    path = os.path.abspath(os.path.join(base, sub))
+                    if os.path.isdir(path):
+                        env[key] = path
+                        break
         return env
 
     def server_cmd(self):

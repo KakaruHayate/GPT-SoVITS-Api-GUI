@@ -822,6 +822,7 @@ class TTSGUI(QMainWindow):
             self.api_status_label.setText(self.tr("状态: API 就绪"))
             self.check_api_button.setEnabled(True)
             self.synthesize_button.setEnabled(True)
+            self.refresh_voices()
             if self.api_check_thread:
                 self.api_check_thread.stop()
                 self.api_check_thread = None
@@ -924,7 +925,7 @@ class TTSGUI(QMainWindow):
     def on_voices_ready(self, voices, current, error):
         self.refresh_voices_button.setEnabled(True)
         if error:
-            self.statusBar.showMessage(self.tr("获取音色失败: ") + str(error), 5000)
+            # normal while the backend is still starting; the API-ready handler retries
             if self.voice_combo.count() == 0:
                 self.voice_combo.addItem("default", "default")
             return
