@@ -139,6 +139,8 @@ class GsvBackend:
             "127.0.0.1",
             "--port",
             str(self.sidecar_port),
+            "--parent-pid",
+            str(os.getpid()),
         ]
 
     def sidecar_env(self):
@@ -169,6 +171,8 @@ class GsvBackend:
             str(self.port),
             "--sidecar",
             "127.0.0.1:%d" % self.sidecar_port,
+            "--parent-pid",
+            str(os.getpid()),
         ]
         for d in self.allow_dirs:
             cmd += ["--allow-path", d]
