@@ -11,7 +11,7 @@ from datetime import datetime
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, QComboBox,
-                             QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit,
+                             QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit, QProgressBar,
                              QFileDialog, QGroupBox, QMessageBox, QStatusBar, QInputDialog, QGridLayout,
                              QFormLayout, QSizePolicy)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QFileSystemWatcher, QTimer
@@ -539,9 +539,17 @@ class TTSGUI(QMainWindow):
         control_edit_group.setLayout(control_edit_layout)
         main_layout.addWidget(control_edit_group)
 
-        # Status bar
+        # Status bar + rendering progress
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setFixedWidth(220)
+        self.progress_bar.setVisible(False)
+        self.statusBar.addPermanentWidget(self.progress_bar)
+        self.progress_timer = QTimer(self)
+        self.progress_timer.setInterval(400)
+        self.progress_timer.timeout.connect(self.update_progress)
 
         # Update model lists
         self.update_model_lists()
@@ -904,10 +912,23 @@ class TTSGUI(QMainWindow):
             self.param_widgets['dbcache'].setEnabled(dev)
 
     def on_mode_changed(self):
+        dev = self.get_model_version() == 'v5dev'
         steps = self.DEFAULT_STEPS.get(self.get_model_version(), 4)
         idx = self.param_widgets['sample_steps'].findData(steps)
         if idx >= 0:
             self.param_widgets['sample_steps'].setCurrentIndex(idx)
+        # cache-dit only exists for v5dev; turbo is a fixed 4-step DMD model
+        cache = self.param_widgets.get('dbcache')
+        if cache is not None:
+            cache.setEnabled(dev)
+            if not dev:
+                off = cache.findData('off')
+                if off >= 0:
+                    cache.setCurrentIndex(off)
+            elif cache.currentData() == 'off':
+                auto = cache.findData('auto')
+                if auto >= 0:
+                    cache.setCurrentIndex(auto)
         self.update_param_restrictions()
 
     def refresh_voices(self):
@@ -961,13 +982,24 @@ class TTSGUI(QMainWindow):
 
         params = self.get_current_parameters()
         api_url = self.api_url_input.text()
+        try:
+            params['ref_audio_path'] = self.prepare_reference_audio(
+                params.get('ref_audio_path', ''), api_url)
+        except Exception as e:
+            self.synthesis_error(self.tr("参考音频处理失败: {}").format(str(e)))
+            return
 
         self.tts_thread = TTSThread(api_url, params, self.cache_dir)
         self.tts_thread.finished.connect(self.synthesis_finished)
         self.tts_thread.error.connect(self.synthesis_error)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.progress_timer.start()
         self.tts_thread.start()
 
     def synthesis_finished(self, audio_file):
+        self.progress_timer.stop()
+        self.progress_bar.setVisible(False)
         self.current_audio_file = audio_file
         self.audio_cache = {}
         self.edit_stack = []
@@ -990,6 +1022,8 @@ class TTSGUI(QMainWindow):
             self.save_button.setEnabled(True)
 
     def synthesis_error(self, error_message):
+        self.progress_timer.stop()
+        self.progress_bar.setVisible(False)
         self.synthesize_button.setEnabled(True)
         self.statusBar.showMessage(self.tr("合成失败!"))
         msg = str(error_message)
@@ -1009,6 +1043,34 @@ class TTSGUI(QMainWindow):
                     self.allow_reference_dir(ref_dir)
                     return
         QMessageBox.critical(self, self.tr("合成语音失败"), msg)
+
+    def prepare_reference_audio(self, path, api_url):
+        """Accept mp3/flac/ogg/... and stereo audio: convert to a mono 16-bit wav and upload it
+        to the engine (/reference stores it under <temp>/gsv_refs, which is always allowed)."""
+        if not path:
+            return path
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".wav":
+            return path   # the engine reads PCM 8/16/24/32 and float, mono or multi-channel
+        import tempfile
+        data, sr = sf.read(path, always_2d=True)
+        if data.shape[1] > 1:
+            data = data.mean(axis=1)
+        fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="gsv_ref_")
+        os.close(fd)
+        try:
+            sf.write(tmp, data, sr, subtype="PCM_16")
+            with open(tmp, "rb") as f:
+                body = f.read()
+            r = requests.post(api_url.rstrip("/") + "/reference",
+                              params={"name": os.path.basename(tmp)}, data=body, timeout=120)
+            r.raise_for_status()
+            return r.json()["path"]
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     def allow_reference_dir(self, path):
         """Add `path` to the backend allow list and restart it so the next synth can read it."""
@@ -1032,6 +1094,29 @@ class TTSGUI(QMainWindow):
             self.tr("已更新"),
             self.tr("已把目录加入允许列表并重启后端；状态变为“API 就绪”后请再次点击“开始合成”。"),
         )
+
+    def update_progress(self):
+        """Poll /progress: 1 g2p, 2 AR, 3 DiT/CFM, 4 vocoder, 5 done."""
+        try:
+            r = requests.get(self.api_url_input.text().rstrip("/") + "/progress", timeout=2)
+            if r.status_code != 200:
+                return
+            j = r.json()
+            stage, cur, total = int(j.get("stage", 0)), int(j.get("cur", 0)), int(j.get("total", 0))
+            frac = (cur / total) if total > 0 else 0.0
+            if stage <= 1:
+                pct = 2
+            elif stage == 2:
+                pct = 5 + int(25 * frac)
+            elif stage == 3:
+                pct = 30 + int(60 * frac)
+            elif stage == 4:
+                pct = 92
+            else:
+                pct = 100
+            self.progress_bar.setValue(max(0, min(100, pct)))
+        except Exception:
+            pass
 
     def setup_edit_actions(self):
         self.delete_button.setEnabled(False)
