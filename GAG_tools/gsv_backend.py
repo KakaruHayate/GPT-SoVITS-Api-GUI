@@ -83,7 +83,7 @@ class GsvBackend:
                 ("GSV_BERT_DIR", "bert_tokenizer"),
                 ("NLTK_DATA", "nltk_data"),
             ):
-                path = os.path.join(self.data_dir, sub)
+                path = os.path.abspath(os.path.join(self.data_dir, sub))
                 if os.path.isdir(path):
                     env[key] = path
         return env
