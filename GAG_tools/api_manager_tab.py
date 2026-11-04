@@ -112,7 +112,8 @@ class APIManager(QWidget):
         row.addWidget(QLabel(self.tr("Reference dirs:")))
         self.allow_input = QLineEdit(self.config_manager.get_value("allow_dirs"))
         self.allow_input.setToolTip(
-            self.tr("Directories the engine may read reference audio from, separated by ';'")
+            self.tr("Directories the engine may read reference audio from, separated by ';'. "
+                    "Leave empty to allow every directory.")
         )
         row.addWidget(self.allow_input)
         cfg_layout.addLayout(row)
@@ -237,8 +238,8 @@ class APIManager(QWidget):
         host, port = self.parse_url()
         allow = [d.strip() for d in self.allow_input.text().replace(",", ";").split(";") if d.strip()]
         models = self.models_input.text().strip()
-        if not allow and models:
-            allow = [models]
+        if not allow:
+            allow = ["*"]   # empty field = allow every directory
         return GsvBackend(
             server_path=self.server_input.text().strip(),
             models_dir=models,

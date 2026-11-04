@@ -115,15 +115,46 @@ class GsvBackend:
             raise FileNotFoundError(self.server_path)
         sc = self.sidecar_cmd()
         if sc:
-            self.log("[gsv] sidecar: %s" % " ".join(sc))
-            self.sidecar = _spawn(sc, env=self.sidecar_env())
-            self._attach_reader(self.sidecar, "sidecar")
-            if not self.wait_sidecar(min(120.0, timeout)):
-                self.log("[gsv] warning: sidecar did not become ready")
+            # A sidecar left over from a previous run is fine to reuse; spawning a second one
+            # would fail to bind the port and leave the server without a sidecar.
+            if self.sidecar_up():
+                self.log("[gsv] reusing sidecar already listening on :%d" % self.sidecar_port)
+            else:
+                self.log("[gsv] sidecar: %s" % " ".join(sc))
+                self.sidecar = _spawn(sc, env=self.sidecar_env())
+                self._attach_reader(self.sidecar, "sidecar")
+                if not self.wait_sidecar(min(120.0, timeout)):
+                    self.log("[gsv] sidecar not ready, retrying once")
+                    self.stop_sidecar()
+                    time.sleep(1.5)
+                    self.sidecar = _spawn(sc, env=self.sidecar_env())
+                    self._attach_reader(self.sidecar, "sidecar")
+                    if not self.wait_sidecar(min(120.0, timeout)):
+                        self.log("[gsv] warning: sidecar did not become ready")
         self.log("[gsv] server: %s" % " ".join(self.server_cmd()))
         self.server = _spawn(self.server_cmd())
         self._attach_reader(self.server, "server")
         return self.wait_health(timeout)
+
+    def sidecar_up(self):
+        url = "http://127.0.0.1:%d/health" % self.sidecar_port
+        try:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                return bool(json.loads(r.read().decode("utf-8")).get("ready"))
+        except Exception:
+            return False
+
+    def stop_sidecar(self):
+        if self.sidecar and self.sidecar.poll() is None:
+            try:
+                self.sidecar.terminate()
+                self.sidecar.wait(timeout=5)
+            except Exception:
+                try:
+                    self.sidecar.kill()
+                except Exception:
+                    pass
+        self.sidecar = None
 
     def _attach_reader(self, proc, tag):
         def pump():
