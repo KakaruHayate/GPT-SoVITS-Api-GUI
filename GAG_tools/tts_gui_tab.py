@@ -809,12 +809,12 @@ class TTSGUI(QMainWindow):
             QMessageBox.warning(self, self.tr("错误"), self.tr("指定的保存文件夹不存在"))
 
     def browse_file(self, param_name):
-        file_name, _ = QFileDialog.getOpenFileName(self, self.tr("选择音频文件"), "", self.tr("Audio Files (*.wav)"))
+        file_name, _ = QFileDialog.getOpenFileName(self, self.tr("选择音频文件"), "", self.tr("Audio Files (*.wav *.mp3 *.flac *.ogg *.m4a *.aac *.aiff *.aif *.opus *.wma)"))
         if file_name:
             self.param_widgets[param_name].setText(file_name)
 
     def browse_files(self, param_name):
-        files, _ = QFileDialog.getOpenFileNames(self, self.tr("选择音频文件"), "", self.tr("Audio Files (*.wav)"))
+        files, _ = QFileDialog.getOpenFileNames(self, self.tr("选择音频文件"), "", self.tr("Audio Files (*.wav *.mp3 *.flac *.ogg *.m4a *.aac *.aiff *.aif *.opus *.wma)"))
         if files:
             self.param_widgets[param_name].setText(';'.join(files))
 
