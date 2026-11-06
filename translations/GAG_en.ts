@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE TS>
 <TS version="2.1" language="en" sourcelanguage="zh">
 <context>
@@ -873,15 +873,8 @@ GitHub: https://github.com/AliceNavigator/GPT-SoVITS-Api-GUI        by 领航员
         <source>采样步数:</source>
         <translation>Sample Steps:</translation>
     </message>
-    <message>
-        <location filename="../GAG_tools/tts_gui_tab.py" line="781"/>
-        <source>CFG跳过:</source>
-        <translation>CFG Skip:</translation>
-    </message>
-    <message>
-        <source>不跳</source>
-        <translation>No Skip</translation>
-    </message>
+
+
     <message>
         <source>关</source>
         <translation>Off</translation>

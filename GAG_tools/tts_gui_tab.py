@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 import re
 import time
@@ -398,9 +398,6 @@ class TTSGUI(QMainWindow):
             'auto': self.tr('自动'),
             'f4': 'F4', 'f8': 'F8', 'f16': 'F16',
         }
-        # DiT alg switch: CFG skip ratio (%)
-        self.CFG_SKIP_MODES = {0: self.tr('不跳'), 20: '20%', 30: '30%', 40: '40%', 50: '50%'}
-        self.DEFAULT_CFG_SKIP = 30     # CFG 跳过默认跳末 30% 步
         self.DEFAULT_STEPS = {'v5turbo': 4, 'v5dev': 32}
         self.config_manager = ConfigManager()
         self.setup_cache_directory()
@@ -777,25 +774,9 @@ class TTSGUI(QMainWindow):
         self.param_widgets['skip_first_step'].setToolTip(
             self.tr("跳过 DiT 采样第一步的模型调用 (等于该步用 0 速度)。速度略快，个别句子会有细微差别。"))
 
-        # DiT alg switch: CFG skip ratio (%)
-        self.param_widgets['dit_cfg_skip'] = QComboBox()
-        for key, label in self.CFG_SKIP_MODES.items():
-            self.param_widgets['dit_cfg_skip'].addItem(label, key)
-        self.param_widgets['dit_cfg_skip'].setCurrentIndex(
-            list(self.CFG_SKIP_MODES.keys()).index(self.DEFAULT_CFG_SKIP))
-        self.param_widgets['dit_cfg_skip'].setToolTip(
-            self.tr("从第 (1-跳过量) 步开始不再计算 Uncond 分支。只有 cfg_rate>0 时才有意义 —— "
-                    "基座/default 与 V5 Turbo 的 cfg_rate 都是 0，那里选什么都一样。"))
-        skip_widget = QWidget()
-        skip_layout = QHBoxLayout(skip_widget)
-        skip_layout.setContentsMargins(0, 0, 0, 0)
-        skip_layout.addWidget(QLabel(self.tr("CFG跳过:")))
-        skip_layout.addWidget(self.param_widgets['dit_cfg_skip'])
-
         options_grid.addWidget(steps_widget, 0, 0)
         options_grid.addWidget(cache_widget, 0, 1)
-        options_grid.addWidget(skip_widget, 1, 0)
-        options_grid.addWidget(self.param_widgets['skip_first_step'], 2, 0)
+        options_grid.addWidget(self.param_widgets['skip_first_step'], 1, 0)
 
         gen_layout.addLayout(options_grid)
 
@@ -940,10 +921,6 @@ class TTSGUI(QMainWindow):
         dev = self.get_model_version() == 'v5dev'
         if 'dbcache' in self.param_widgets:
             self.param_widgets['dbcache'].setEnabled(dev)
-        # CFG skip needs an Uncond branch (cfg > 0): v5turbo is a fixed 4-step DMD
-        # model with cfg = 0, so the knob is greyed out there
-        if 'dit_cfg_skip' in self.param_widgets:
-            self.param_widgets['dit_cfg_skip'].setEnabled(dev)
 
     def _sync_voice_to_mode(self):
         """Keep the voice combo in sync with the selected model version.
@@ -961,7 +938,7 @@ class TTSGUI(QMainWindow):
             combo.setCurrentIndex(idx)
 
     def on_voice_changed(self):
-        """音色 -> 模型版本: 选到 v5dev/v5turbo 时把步数/cache-dit/CFG跳过 一起同步过去。
+        """音色 -> 模型版本: 选到 v5dev/v5turbo 时把步数/cache-dit 一起同步过去。
 
         两个下拉本来就是同一件事（voice 决定权重集），只让"模型版本"能带动"音色"会让人
         以为选了 V5 Dev 就在用 V5 Dev；反向也接上，谁动都一致。
@@ -988,18 +965,6 @@ class TTSGUI(QMainWindow):
                 auto = cache.findData('auto')
                 if auto >= 0:
                     cache.setCurrentIndex(auto)
-        # CFG skip: 只有 v5dev 的 cfg_rate=1.30 才有 Uncond 分支可跳
-        skip = self.param_widgets.get('dit_cfg_skip')
-        if skip is not None:
-            skip.setEnabled(dev)
-            if not dev:
-                zero = skip.findData(0)
-                if zero >= 0:
-                    skip.setCurrentIndex(zero)      # 非 v5dev: 强制回"不跳"
-            elif skip.currentData() in (0, None):
-                rec = skip.findData(self.DEFAULT_CFG_SKIP)   # 刚被上面的分支清过 -> 用推荐档
-                if rec >= 0:
-                    skip.setCurrentIndex(rec)
         self._sync_voice_to_mode()
         self.update_param_restrictions()
 
@@ -1029,14 +994,13 @@ class TTSGUI(QMainWindow):
             self._voice_retry = 0
 
     def _voice_hint(self, name):
-        """下拉项的提示: gsv.cpp 里 voice 决定权重集, 顺带决定 cfg 有没有 Uncond 支路。"""
+        """下拉项的提示: gsv.cpp 里 voice 决定权重集, 顺带决定 cfg_rate。"""
         hints = {
-            'default': self.tr("基座权重 (models 根目录的 gguf, 与 v5turbo 是同一套)。cfg_rate=0: "
-                              "没有 CFG 支路, \"CFG跳过\" 对它不起作用。"),
+            'default': self.tr("基座权重 (models 根目录的 gguf, 与 v5turbo 是同一套)。cfg_rate=0。"),
             'v5turbo': self.tr("V5 Turbo: 与 default 同一套权重, 只是显式清单 + 默认 4 步 DMD。"
-                              "cfg_rate=0, 同样没有 CFG 支路。"),
+                              "cfg_rate=0。"),
             'v5dev': self.tr("V5 Dev: 独立权重 (v5dev-dit/cond/refcode), 32 步 + cfg_rate=1.30, "
-                             "可以开 cache-dit 和 \"CFG跳过\"。"),
+                             "可以开 cache-dit。"),
         }
         return hints.get(name, self.tr("自定义声线 (runtime/models/voices/{}/manifest.json)。"
                                       ).format(name))
@@ -1602,16 +1566,8 @@ class TTSGUI(QMainWindow):
         else:
             params['dbcache'] = 'off'
 
-        # DiT alg switches: local-attention window (frames) and CFG skip ratio (%)
-        if self.get_model_version() == 'v5dev':
-            skip_pct = self.param_widgets['dit_cfg_skip'].currentData() or 0
-            # skip ratio r% -> engine's dit_cfg_off_t = 1 - r/100
-            params['dit_cfg_off_t'] = round(1.0 - float(skip_pct) / 100.0, 4)
-        else:
-            params['dit_cfg_off_t'] = 0.0
-
         for param, widget in self.param_widgets.items():
-            if param in ('sample_steps', 'dbcache', 'dit_cfg_skip'):
+            if param in ('sample_steps', 'dbcache'):
                 continue
             if isinstance(widget, QLineEdit):
                 value = widget.text()
