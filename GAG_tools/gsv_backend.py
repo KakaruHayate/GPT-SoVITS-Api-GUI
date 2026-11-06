@@ -165,7 +165,9 @@ class GsvBackend:
         cmd = [
             self.server_path,
             "--models",
-            self.models_dir,
+            # 绝对路径: 配置里存的是 "runtime/models" 这种相对路径, 交给服务端后它会跟 voice
+            # manifest 里的相对文件名叠加成不存在的路径 (voice 切换几毫秒失败)。
+            os.path.abspath(self.models_dir) if self.models_dir else self.models_dir,
             "--device",
             self.device,
             "--port",
