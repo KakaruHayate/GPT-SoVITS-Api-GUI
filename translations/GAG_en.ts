@@ -874,6 +874,24 @@ GitHub: https://github.com/AliceNavigator/GPT-SoVITS-Api-GUI        by 领航员
         <translation>Sample Steps:</translation>
     </message>
     <message>
+        <location filename="../GAG_tools/tts_gui_tab.py" line="776"/>
+        <source>局部注意力:</source>
+        <translation>Local Attention:</translation>
+    </message>
+    <message>
+        <location filename="../GAG_tools/tts_gui_tab.py" line="781"/>
+        <source>CFG跳过:</source>
+        <translation>CFG Skip:</translation>
+    </message>
+    <message>
+        <source>不跳</source>
+        <translation>No Skip</translation>
+    </message>
+    <message>
+        <source>关</source>
+        <translation>Off</translation>
+    </message>
+    <message>
         <location filename="../GAG_tools/tts_gui_tab.py" line="227"/>
         <source>在这里输入需要合成的文本...
 

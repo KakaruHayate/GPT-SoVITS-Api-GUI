@@ -69,6 +69,8 @@ class ConfigManager:
                         'sample_steps': 4,
                         'dbcache': 'auto',
                         'skip_first_step': 0,
+                        'dit_window': 128,
+                        'dit_cfg_skip': 30,
                     }
                 },
                 'current_preset': 'Default',

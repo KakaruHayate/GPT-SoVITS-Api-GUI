@@ -561,6 +561,10 @@ class BatchTTS(QWidget):
             'sample_steps': preset_config.get('sample_steps', 4),
             'skip_first_step': preset_config.get('skip_first_step', 0),
             'dbcache': preset_config.get('dbcache', 'auto') if preset_config.get('model_version', 'v5turbo') == 'v5dev' else 'off',
+            'dit_window': preset_config.get('dit_window', 128),
+            # CFG skip only has an Uncond branch on v5dev; turbo has cfg = 0
+            'dit_cfg_off_t': (round(1.0 - float(preset_config.get('dit_cfg_skip', 30)) / 100.0, 4)
+                              if preset_config.get('model_version', 'v5turbo') == 'v5dev' else 0.0),
             'streaming_mode': False,
         }
 

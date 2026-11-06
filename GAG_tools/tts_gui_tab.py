@@ -391,6 +391,11 @@ class TTSGUI(QMainWindow):
             'auto': self.tr('自动'),
             'f4': 'F4', 'f8': 'F8', 'f16': 'F16',
         }
+        # DiT 算法开关: 局部注意力窗 (帧) 与 CFG 跳过比率 (%)
+        self.WINDOW_MODES = {0: self.tr('关'), 64: '64', 128: '128', 256: '256'}
+        self.CFG_SKIP_MODES = {0: self.tr('不跳'), 20: '20%', 30: '30%', 40: '40%', 50: '50%'}
+        self.DEFAULT_WINDOW = 128      # DiTFastAttn 窗口默认开 (质量近无损)
+        self.DEFAULT_CFG_SKIP = 30     # CFG 跳过默认跳末 30% 步
         self.DEFAULT_STEPS = {'v5turbo': 4, 'v5dev': 32}
         self.config_manager = ConfigManager()
         self.setup_cache_directory()
@@ -764,9 +769,34 @@ class TTSGUI(QMainWindow):
         # skip_first_step: skip the first AR step ("跳1步")
         self.param_widgets['skip_first_step'] = QCheckBox(self.tr("跳过首步"))
 
+        # DiT alg: local-attention window (frames) and CFG skip ratio (%)
+        self.param_widgets['dit_window'] = QComboBox()
+        for key, label in self.WINDOW_MODES.items():
+            self.param_widgets['dit_window'].addItem(label, key)
+        self.param_widgets['dit_window'].setCurrentIndex(
+            list(self.WINDOW_MODES.keys()).index(self.DEFAULT_WINDOW))
+        win_widget = QWidget()
+        win_layout = QHBoxLayout(win_widget)
+        win_layout.setContentsMargins(0, 0, 0, 0)
+        win_layout.addWidget(QLabel(self.tr("局部注意力:")))
+        win_layout.addWidget(self.param_widgets['dit_window'])
+
+        self.param_widgets['dit_cfg_skip'] = QComboBox()
+        for key, label in self.CFG_SKIP_MODES.items():
+            self.param_widgets['dit_cfg_skip'].addItem(label, key)
+        self.param_widgets['dit_cfg_skip'].setCurrentIndex(
+            list(self.CFG_SKIP_MODES.keys()).index(self.DEFAULT_CFG_SKIP))
+        skip_widget = QWidget()
+        skip_layout = QHBoxLayout(skip_widget)
+        skip_layout.setContentsMargins(0, 0, 0, 0)
+        skip_layout.addWidget(QLabel(self.tr("CFG跳过:")))
+        skip_layout.addWidget(self.param_widgets['dit_cfg_skip'])
+
         options_grid.addWidget(steps_widget, 0, 0)
         options_grid.addWidget(cache_widget, 0, 1)
-        options_grid.addWidget(self.param_widgets['skip_first_step'], 1, 0)
+        options_grid.addWidget(win_widget, 1, 0)
+        options_grid.addWidget(skip_widget, 1, 1)
+        options_grid.addWidget(self.param_widgets['skip_first_step'], 2, 0)
 
         gen_layout.addLayout(options_grid)
 
@@ -911,6 +941,25 @@ class TTSGUI(QMainWindow):
         dev = self.get_model_version() == 'v5dev'
         if 'dbcache' in self.param_widgets:
             self.param_widgets['dbcache'].setEnabled(dev)
+        # CFG skip needs an Uncond branch (cfg > 0): v5turbo is a fixed 4-step DMD
+        # model with cfg = 0, so the knob is greyed out there
+        if 'dit_cfg_skip' in self.param_widgets:
+            self.param_widgets['dit_cfg_skip'].setEnabled(dev)
+
+    def _sync_voice_to_mode(self):
+        """Keep the voice combo in sync with the selected model version.
+
+        The one-click package registers one voice per model version ("v5turbo" and
+        "v5dev"), so picking "V5 Dev" has to also switch the voice, otherwise the
+        server keeps synthesising with the turbo weights at 32 steps. Custom voice
+        names do not match a version key, so they are left untouched.
+        """
+        combo = self.voice_combo
+        if combo is None:
+            return
+        idx = combo.findData(self.get_model_version())
+        if idx >= 0 and idx != combo.currentIndex():
+            combo.setCurrentIndex(idx)
 
     def on_mode_changed(self):
         dev = self.get_model_version() == 'v5dev'
@@ -930,6 +979,15 @@ class TTSGUI(QMainWindow):
                 auto = cache.findData('auto')
                 if auto >= 0:
                     cache.setCurrentIndex(auto)
+        # CFG skip: turbo has no Uncond branch -> disabled (and reset to "no skip")
+        skip = self.param_widgets.get('dit_cfg_skip')
+        if skip is not None:
+            skip.setEnabled(dev)
+            if not dev:
+                zero = skip.findData(0)
+                if zero >= 0:
+                    skip.setCurrentIndex(zero)
+        self._sync_voice_to_mode()
         self.update_param_restrictions()
 
     def refresh_voices(self):
@@ -959,6 +1017,7 @@ class TTSGUI(QMainWindow):
         idx = self.voice_combo.findData(want)
         if idx >= 0:
             self.voice_combo.setCurrentIndex(idx)
+        self._sync_voice_to_mode()
 
     def update_model_lists(self):
         self.refresh_voices()
@@ -1497,8 +1556,17 @@ class TTSGUI(QMainWindow):
         else:
             params['dbcache'] = 'off'
 
+        # DiT alg switches: local-attention window (frames) and CFG skip ratio (%)
+        params['dit_window'] = self.param_widgets['dit_window'].currentData()
+        if self.get_model_version() == 'v5dev':
+            skip_pct = self.param_widgets['dit_cfg_skip'].currentData() or 0
+            # skip ratio r% -> engine's dit_cfg_off_t = 1 - r/100
+            params['dit_cfg_off_t'] = round(1.0 - float(skip_pct) / 100.0, 4)
+        else:
+            params['dit_cfg_off_t'] = 0.0
+
         for param, widget in self.param_widgets.items():
-            if param in ('sample_steps', 'dbcache'):
+            if param in ('sample_steps', 'dbcache', 'dit_window', 'dit_cfg_skip'):
                 continue
             if isinstance(widget, QLineEdit):
                 value = widget.text()
