@@ -391,10 +391,8 @@ class TTSGUI(QMainWindow):
             'auto': self.tr('自动'),
             'f4': 'F4', 'f8': 'F8', 'f16': 'F16',
         }
-        # DiT 算法开关: 局部注意力窗 (帧) 与 CFG 跳过比率 (%)
-        self.WINDOW_MODES = {0: self.tr('关'), 64: '64', 128: '128', 256: '256'}
+        # DiT alg switch: CFG skip ratio (%)
         self.CFG_SKIP_MODES = {0: self.tr('不跳'), 20: '20%', 30: '30%', 40: '40%', 50: '50%'}
-        self.DEFAULT_WINDOW = 128      # DiTFastAttn 窗口默认开 (质量近无损)
         self.DEFAULT_CFG_SKIP = 30     # CFG 跳过默认跳末 30% 步
         self.DEFAULT_STEPS = {'v5turbo': 4, 'v5dev': 32}
         self.config_manager = ConfigManager()
@@ -769,18 +767,7 @@ class TTSGUI(QMainWindow):
         # skip_first_step: skip the first AR step ("跳1步")
         self.param_widgets['skip_first_step'] = QCheckBox(self.tr("跳过首步"))
 
-        # DiT alg: local-attention window (frames) and CFG skip ratio (%)
-        self.param_widgets['dit_window'] = QComboBox()
-        for key, label in self.WINDOW_MODES.items():
-            self.param_widgets['dit_window'].addItem(label, key)
-        self.param_widgets['dit_window'].setCurrentIndex(
-            list(self.WINDOW_MODES.keys()).index(self.DEFAULT_WINDOW))
-        win_widget = QWidget()
-        win_layout = QHBoxLayout(win_widget)
-        win_layout.setContentsMargins(0, 0, 0, 0)
-        win_layout.addWidget(QLabel(self.tr("局部注意力:")))
-        win_layout.addWidget(self.param_widgets['dit_window'])
-
+        # DiT alg switch: CFG skip ratio (%)
         self.param_widgets['dit_cfg_skip'] = QComboBox()
         for key, label in self.CFG_SKIP_MODES.items():
             self.param_widgets['dit_cfg_skip'].addItem(label, key)
@@ -794,8 +781,7 @@ class TTSGUI(QMainWindow):
 
         options_grid.addWidget(steps_widget, 0, 0)
         options_grid.addWidget(cache_widget, 0, 1)
-        options_grid.addWidget(win_widget, 1, 0)
-        options_grid.addWidget(skip_widget, 1, 1)
+        options_grid.addWidget(skip_widget, 1, 0)
         options_grid.addWidget(self.param_widgets['skip_first_step'], 2, 0)
 
         gen_layout.addLayout(options_grid)
@@ -1557,7 +1543,6 @@ class TTSGUI(QMainWindow):
             params['dbcache'] = 'off'
 
         # DiT alg switches: local-attention window (frames) and CFG skip ratio (%)
-        params['dit_window'] = self.param_widgets['dit_window'].currentData()
         if self.get_model_version() == 'v5dev':
             skip_pct = self.param_widgets['dit_cfg_skip'].currentData() or 0
             # skip ratio r% -> engine's dit_cfg_off_t = 1 - r/100
@@ -1566,7 +1551,7 @@ class TTSGUI(QMainWindow):
             params['dit_cfg_off_t'] = 0.0
 
         for param, widget in self.param_widgets.items():
-            if param in ('sample_steps', 'dbcache', 'dit_window', 'dit_cfg_skip'):
+            if param in ('sample_steps', 'dbcache', 'dit_cfg_skip'):
                 continue
             if isinstance(widget, QLineEdit):
                 value = widget.text()
