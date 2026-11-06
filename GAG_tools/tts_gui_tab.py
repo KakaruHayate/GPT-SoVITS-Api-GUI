@@ -249,12 +249,19 @@ class ModelSwitchThread(QThread):
 
 
 class VoiceListThread(QThread):
-    """Fetch the registered voices from gsv_server (GET /models)."""
-    voices_ready = pyqtSignal(list, str, str)
+    """Fetch the registered voices from gsv_server (GET /models).
+
+    结果放在 self.result 里, 由 finished 信号在主线程读回。
+
+    以前是 run() 里 emit 一个自定义信号 + finished->deleteLater：两个都是跨线程排队事件，
+    deleteLater 有机会先落地，那个 voices_ready 就被丢掉 —— 实测就是这个原因让"音色"下拉永远
+    只剩初始化时的 "default"，即使服务端 /models 明明返回了 default/v5dev/v5turbo。
+    """
 
     def __init__(self, url):
         super().__init__()
         self.url = url.rstrip('/')
+        self.result = ([], "", "not started")
 
     def run(self):
         try:
@@ -267,9 +274,9 @@ class VoiceListThread(QThread):
                 elif isinstance(v, str):
                     voices.append(v)
             voices = [v for v in voices if v]
-            self.voices_ready.emit(voices, data.get("current", ""), "")
+            self.result = (voices, data.get("current", ""), "")
         except Exception as e:
-            self.voices_ready.emit([], "", str(e))
+            self.result = ([], "", str(e))
 
 
 class TTSThread(QThread):
@@ -619,6 +626,7 @@ class TTSGUI(QMainWindow):
         self.refresh_voices_button.setFixedWidth(50)
         self.refresh_voices_button.clicked.connect(self.refresh_voices)
         voice_layout.addWidget(self.refresh_voices_button)
+        self.voice_combo.currentIndexChanged.connect(self.on_voice_changed)
         model_layout.addRow(self.tr("音色 (voice):"), voice_row)
 
         self.mode_combo = QComboBox()
@@ -764,8 +772,10 @@ class TTSGUI(QMainWindow):
         cache_layout.addWidget(QLabel(self.tr("cache-dit:")))
         cache_layout.addWidget(self.param_widgets['dbcache'])
 
-        # skip_first_step: skip the first AR step ("跳1步")
+        # skip_first_step: skip the first DiT sampling step (velocity is taken as 0 once)
         self.param_widgets['skip_first_step'] = QCheckBox(self.tr("跳过首步"))
+        self.param_widgets['skip_first_step'].setToolTip(
+            self.tr("跳过 DiT 采样第一步的模型调用 (等于该步用 0 速度)。速度略快，个别句子会有细微差别。"))
 
         # DiT alg switch: CFG skip ratio (%)
         self.param_widgets['dit_cfg_skip'] = QComboBox()
@@ -773,6 +783,9 @@ class TTSGUI(QMainWindow):
             self.param_widgets['dit_cfg_skip'].addItem(label, key)
         self.param_widgets['dit_cfg_skip'].setCurrentIndex(
             list(self.CFG_SKIP_MODES.keys()).index(self.DEFAULT_CFG_SKIP))
+        self.param_widgets['dit_cfg_skip'].setToolTip(
+            self.tr("从第 (1-跳过量) 步开始不再计算 Uncond 分支。只有 cfg_rate>0 时才有意义 —— "
+                    "基座/default 与 V5 Turbo 的 cfg_rate 都是 0，那里选什么都一样。"))
         skip_widget = QWidget()
         skip_layout = QHBoxLayout(skip_widget)
         skip_layout.setContentsMargins(0, 0, 0, 0)
@@ -947,6 +960,16 @@ class TTSGUI(QMainWindow):
         if idx >= 0 and idx != combo.currentIndex():
             combo.setCurrentIndex(idx)
 
+    def on_voice_changed(self):
+        """音色 -> 模型版本: 选到 v5dev/v5turbo 时把步数/cache-dit/CFG跳过 一起同步过去。
+
+        两个下拉本来就是同一件事（voice 决定权重集），只让"模型版本"能带动"音色"会让人
+        以为选了 V5 Dev 就在用 V5 Dev；反向也接上，谁动都一致。
+        """
+        idx = self.mode_combo.findData(self.voice_combo.currentData())
+        if idx >= 0 and idx != self.mode_combo.currentIndex():
+            self.mode_combo.setCurrentIndex(idx)      # -> on_mode_changed -> _sync_voice_to_mode (同一项, 无副作用)
+
     def on_mode_changed(self):
         dev = self.get_model_version() == 'v5dev'
         steps = self.DEFAULT_STEPS.get(self.get_model_version(), 4)
@@ -965,45 +988,82 @@ class TTSGUI(QMainWindow):
                 auto = cache.findData('auto')
                 if auto >= 0:
                     cache.setCurrentIndex(auto)
-        # CFG skip: turbo has no Uncond branch -> disabled (and reset to "no skip")
+        # CFG skip: 只有 v5dev 的 cfg_rate=1.30 才有 Uncond 分支可跳
         skip = self.param_widgets.get('dit_cfg_skip')
         if skip is not None:
             skip.setEnabled(dev)
             if not dev:
                 zero = skip.findData(0)
                 if zero >= 0:
-                    skip.setCurrentIndex(zero)
+                    skip.setCurrentIndex(zero)      # 非 v5dev: 强制回"不跳"
+            elif skip.currentData() in (0, None):
+                rec = skip.findData(self.DEFAULT_CFG_SKIP)   # 刚被上面的分支清过 -> 用推荐档
+                if rec >= 0:
+                    skip.setCurrentIndex(rec)
         self._sync_voice_to_mode()
         self.update_param_restrictions()
 
     def refresh_voices(self):
         """Ask gsv_server for its registered voices (GET /models)."""
-        if getattr(self, '_voice_thread', None) is not None and self._voice_thread.isRunning():
+        thread = getattr(self, '_voice_thread', None)
+        if thread is not None and thread.isRunning():
             return
         url = self.api_url_input.text().strip() or "http://127.0.0.1:9880"
         self.refresh_voices_button.setEnabled(False)
         thread = VoiceListThread(url)
-        thread.voices_ready.connect(self.on_voices_ready)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
+        thread.finished.connect(lambda t=thread: self._on_voice_thread_finished(t))
         self._voice_thread = thread
+        thread.start()
+
+    def _on_voice_thread_finished(self, thread):
+        voices, current, error = thread.result
+        thread.deleteLater()
+        self._voice_thread = None
+        self.on_voices_ready(voices, current, error)
+        # 服务端加载模型要几秒, 启动阶段取一次可能失败: 别把下拉钉死在 "default", 退避重试
+        tries = getattr(self, '_voice_retry', 0)
+        if (error or not voices) and tries < 5:
+            self._voice_retry = tries + 1
+            QTimer.singleShot(1500, self.refresh_voices)
+        else:
+            self._voice_retry = 0
+
+    def _voice_hint(self, name):
+        """下拉项的提示: gsv.cpp 里 voice 决定权重集, 顺带决定 cfg 有没有 Uncond 支路。"""
+        hints = {
+            'default': self.tr("基座权重 (models 根目录的 gguf, 与 v5turbo 是同一套)。cfg_rate=0: "
+                              "没有 CFG 支路, \"CFG跳过\" 对它不起作用。"),
+            'v5turbo': self.tr("V5 Turbo: 与 default 同一套权重, 只是显式清单 + 默认 4 步 DMD。"
+                              "cfg_rate=0, 同样没有 CFG 支路。"),
+            'v5dev': self.tr("V5 Dev: 独立权重 (v5dev-dit/cond/refcode), 32 步 + cfg_rate=1.30, "
+                             "可以开 cache-dit 和 \"CFG跳过\"。"),
+        }
+        return hints.get(name, self.tr("自定义声线 (runtime/models/voices/{}/manifest.json)。"
+                                      ).format(name))
 
     def on_voices_ready(self, voices, current, error):
         self.refresh_voices_button.setEnabled(True)
-        if error:
-            # normal while the backend is still starting; the API-ready handler retries
+        if error or not voices:
+            # normal while the backend is still starting; the retry above tries again
             if self.voice_combo.count() == 0:
                 self.voice_combo.addItem("default", "default")
             return
         prev = self.voice_combo.currentData()
+        self.voice_combo.blockSignals(True)
         self.voice_combo.clear()
-        for v in (voices or ["default"]):
+        for v in voices:
             self.voice_combo.addItem(v, v)
-        want = prev or current or "default"
-        idx = self.voice_combo.findData(want)
-        if idx >= 0:
-            self.voice_combo.setCurrentIndex(idx)
-        self._sync_voice_to_mode()
+            self.voice_combo.setItemData(self.voice_combo.count() - 1, self._voice_hint(v),
+                                         Qt.ToolTipRole)
+        # 保留用户/预设置的音色; 只有在它已经不存在时才回落到模型版本对应的声线
+        want = prev if prev in voices else ""
+        idx = self.voice_combo.findData(want) if want else -1
+        if idx < 0:
+            idx = self.voice_combo.findData(self.get_model_version())
+        if idx < 0:
+            idx = self.voice_combo.findData("default")
+        self.voice_combo.setCurrentIndex(max(0, idx))
+        self.voice_combo.blockSignals(False)
 
     def update_model_lists(self):
         self.refresh_voices()
