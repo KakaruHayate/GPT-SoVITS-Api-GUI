@@ -1,4 +1,4 @@
-﻿import os
+import os
 import time
 import shutil
 import requests
@@ -43,8 +43,17 @@ class TTSTask:
         return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
 
 
+class ApiError(Exception):
+    """A request the engine will reject no matter how often we retry (400 / bad preset)."""
+
+
 class BatchTTS(QWidget):
     status_updated = pyqtSignal(str, str, int, str, float)  # file_path, status, progress, color, remaining_time
+    # 工作线程里绝不直接碰控件: 一律通过信号交给 GUI 线程
+    error_occurred = pyqtSignal(str, str)                   # title, message
+    busy_changed = pyqtSignal(bool)                         # True = 合成中
+    worker_finished = pyqtSignal()                          # 工作线程收尾
+    goto_preset_requested = pyqtSignal()                    # "去配置预设" 按钮
 
     def __init__(self):
         super().__init__()
@@ -86,6 +95,21 @@ class BatchTTS(QWidget):
         preset_layout.addWidget(format_label, 0)
         preset_layout.addWidget(self.format_combo, 2)
         layout.addLayout(preset_layout)
+
+        # 说明: 批量合成吃的是"预设"里的语音设置, Default 只是空模板
+        hint_row = QHBoxLayout()
+        self.preset_hint = QLabel(self.tr(
+            "批量合成会用「预设」里的参考音频与参数逐段合成，所以预设必须是已经配好的"
+            "（参考音频 + 参考音频文本都必填）。「Default」只是空模板，"
+            "选中它点合成会立刻报错 —— 请先到「语音合成」页设好参考音频/文本并点「保存预设」，"
+            "再回本页选择那个预设。"))
+        self.preset_hint.setWordWrap(True)
+        self.preset_hint.setStyleSheet("color: #666666;")
+        hint_row.addWidget(self.preset_hint, 1)
+        self.goto_preset_btn = QPushButton(self.tr("去配置预设"))
+        self.goto_preset_btn.setFixedWidth(110)
+        hint_row.addWidget(self.goto_preset_btn, 0)
+        layout.addLayout(hint_row)
 
         # File list with vertical buttons on the right
         file_section = QHBoxLayout()
@@ -157,6 +181,45 @@ class BatchTTS(QWidget):
         self.synth_btn.clicked.connect(self.start_synthesis)
         self.preset_combo.entered.connect(self._update_preset)
         self.status_updated.connect(self._update_item_status)
+        self.error_occurred.connect(self._show_error)
+        self.busy_changed.connect(self._set_busy)
+        self.worker_finished.connect(self._on_worker_finished)
+        self.goto_preset_btn.clicked.connect(self.goto_preset_requested.emit)
+
+    def _show_error(self, title: str, message: str):
+        QMessageBox.critical(self, title, message)
+
+    def _set_busy(self, busy: bool):
+        self.processing = busy
+        for w in (self.clear_btn, self.move_up_btn, self.move_down_btn, self.remove_btn):
+            w.setEnabled(not busy)
+        self.synth_btn.setText(self.tr("停止合成") if busy else self.tr("开始合成"))
+
+    def _on_worker_finished(self):
+        self.processing = False
+        self._set_busy(False)
+        self.save_current_state()
+
+    def _preset_problem(self, preset_name: str) -> Optional[str]:
+        """Return a human readable reason why this preset cannot be used for batch synthesis."""
+        presets = self.config_manager.get_value('presets', {}) or {}
+        preset = presets.get(preset_name)
+        if not preset:
+            return self.tr("预设 '{}' 不存在，请在「语音合成」页重新保存一个预设。").format(preset_name)
+        ref = (preset.get('ref_audio_path') or '').strip()
+        if not ref:
+            return self.tr(
+                "预设 '{}' 没有参考音频，批量合成无法使用它。\n\n"
+                "批量合成按预设里的参考音频逐段合成，「Default」只是空模板。\n"
+                "请到「语音合成」页选好参考音频（3-10 秒）与参考音频文本，"
+                "点「保存预设」存成新预设，再回本页选择它。").format(preset_name)
+        if not os.path.exists(ref):
+            return self.tr("预设 '{}' 的参考音频文件不存在：\n{}").format(preset_name, ref)
+        if not (preset.get('prompt_text') or '').strip():
+            return self.tr(
+                "预设 '{}' 缺少「参考音频文本」，V3/V4/V5 都不支持无参考文本模式。\n"
+                "请在「语音合成」页补上参考音频文本后重新保存该预设。").format(preset_name)
+        return None
 
     def open_output_folder(self):
         output_folder = self.out_dir_edit.text()
@@ -321,21 +384,63 @@ class BatchTTS(QWidget):
         if hasattr(self, '_last_click_time') and time.time() - self._last_click_time < 1.0:
             return
         self._last_click_time = time.time()
+
         if self.processing:
+            # 停止: 工作线程在下一个检查点退出
             self.processing = False
-            self.clear_btn.setEnabled(True)
-            self.move_up_btn.setEnabled(True)
-            self.move_down_btn.setEnabled(True)
-            self.remove_btn.setEnabled(True)
+            self.busy_changed.emit(False)
             for file_path, task in self.tasks.items():
                 if task.status == 'processing':
                     self._update_item_status(file_path, self.tr("已暂停"), -1, 'blue', 0)
-            self.synth_btn.setText(self.tr("开始合成"))
             return
 
         if not self.file_list.count():
             QMessageBox.warning(self, self.tr("警告"),
                                 self.tr("请先添加需要合成的文件！"))
+            return
+
+        out_dir = self.out_dir_edit.text().strip()
+        if not out_dir:
+            QMessageBox.warning(self, self.tr("警告"),
+                                self.tr("请先设置「批量合成保存路径」！"))
+            return
+        if not os.path.isdir(out_dir):
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except Exception as e:
+                QMessageBox.warning(self, self.tr("警告"),
+                                    self.tr("批量合成保存路径无法创建：\n{}\n{}").format(out_dir, str(e)))
+                return
+
+        # 任务里的预设名可能为空 (旧配置), 用当前下拉补齐
+        current_preset = self.preset_combo.currentText()
+        files = []
+        for i in range(self.file_list.count()):
+            file_path = self.file_list.item(i).text().split(" （")[0]
+            task = self.tasks.get(file_path)
+            if task is None:
+                continue
+            if not task.preset_name:
+                task.preset_name = current_preset
+            files.append(file_path)
+        if not files:
+            QMessageBox.warning(self, self.tr("警告"),
+                                self.tr("请先添加需要合成的文件！"))
+            return
+
+        # 预检: 预设必须已经配好参考音频/参考文本。否则不要发请求去撞 400 ——
+        # Default 这类空模板会在这里就被挡住, 并明确告诉用户怎么建预设。
+        seen_presets, problems = set(), []
+        for file_path in files:
+            preset_name = self.tasks[file_path].preset_name
+            if preset_name in seen_presets:
+                continue
+            seen_presets.add(preset_name)
+            problem = self._preset_problem(preset_name)
+            if problem:
+                problems.append(problem)
+        if problems:
+            QMessageBox.warning(self, self.tr("预设不可用"), "\n\n".join(problems))
             return
 
         for file_path, task in self.tasks.items():
@@ -344,51 +449,43 @@ class BatchTTS(QWidget):
                 task.completed_segments = 0
                 self._update_item_status(file_path, self.tr("准备合成"), -1, 'blue', 0)
 
-        self.processing = True
-        self.clear_btn.setEnabled(False)
-        self.move_up_btn.setEnabled(False)
-        self.move_down_btn.setEnabled(False)
-        self.remove_btn.setEnabled(False)
-        self.synth_btn.setText(self.tr("停止合成"))
-        self.worker_thread = threading.Thread(target=self._synthesis_worker)
+        self.busy_changed.emit(True)
+        self.worker_thread = threading.Thread(
+            target=self._synthesis_worker,
+            args=(files, out_dir, self.format_combo.currentText(), self.url_edit.text().rstrip('/')),
+            daemon=True)
         self.worker_thread.start()
 
-    def _synthesis_worker(self):
-        for i in range(self.file_list.count()):
-            if not self.processing:
-                break
+    def _synthesis_worker(self, files, out_dir, output_format, base_url):
+        try:
+            for file_path in files:
+                if not self.processing:
+                    break
 
-            file_path = self.file_list.item(i).text().split(" （")[0]
-            if file_path not in self.tasks:
-                continue
+                task = self.tasks.get(file_path)
+                if task is None or task.status == 'completed':
+                    continue
 
-            task = self.tasks[file_path]
-            if task.status == 'completed':
-                continue
+                task.status = 'processing'
+                try:
+                    self._process_file(task, out_dir, output_format, base_url)
+                except Exception as e:
+                    task.status = 'failed'
+                    self.status_updated.emit(file_path, self.tr("失败"), -1, 'red', 0)
+                    if self.processing:
+                        self.error_occurred.emit(
+                            self.tr("错误"),
+                            self.tr("处理文件时出错: {}\n\n{}").format(
+                                os.path.basename(file_path), str(e)))
+                    break
 
-            task.status = 'processing'
-
-            try:
-                self._process_file(task)
                 if not self.processing:
                     break
                 task.status = 'completed'
-            except Exception as e:
-                if self.processing:
-                    self.processing = False
-                    QMessageBox.critical(self, self.tr("错误"),
-                                         self.tr("处理文件时出错: {}: {}").format(file_path, str(e)))
-                task.status = 'failed'
-                break
+        finally:
+            self.worker_finished.emit()
 
-        self.processing = False
-        self.clear_btn.setEnabled(True)
-        self.move_up_btn.setEnabled(True)
-        self.move_down_btn.setEnabled(True)
-        self.remove_btn.setEnabled(True)
-        self.synth_btn.setText(self.tr("开始合成"))
-
-    def _process_file(self, task: TTSTask):
+    def _process_file(self, task: TTSTask, out_dir: str, output_format: str, base_url: str):
         try:
             try:
                 with open(task.file_path, 'r', encoding='utf-8') as f:
@@ -401,7 +498,7 @@ class BatchTTS(QWidget):
 
             self.status_updated.emit(task.file_path, self.tr("正在准备文本..."), -1, 'blue', 0)
             base_name = os.path.splitext(os.path.basename(task.file_path))[0]
-            cache_dir = os.path.join(self.out_dir_edit.text(), 'cache', base_name)
+            cache_dir = os.path.join(out_dir, 'cache', base_name)
             os.makedirs(cache_dir, exist_ok=True)
 
             segment_size = self.config_manager.get_value('batch_tts_segment_size', 100)
@@ -437,7 +534,7 @@ class BatchTTS(QWidget):
                     with open(segment_txt, 'r', encoding='utf-8') as f:
                         segment_text = f.read()
 
-                    response = self._synthesize_segment(segment_text)
+                    response = self._synthesize_segment(segment_text, task.preset_name, base_url)
                     if not response:
                         raise Exception(self.tr("合成片段 {} 失败，请检查API状态").format(segment_index))
 
@@ -454,9 +551,9 @@ class BatchTTS(QWidget):
                 self.status_updated.emit(task.file_path, self.tr("正在合成"), task.progress, 'blue', remaining_time)
 
             if task.completed_segments == task.segment_count:
-                output_format = self.format_combo.currentText()
+                output_format = output_format or 'wav'
                 output_file = os.path.join(
-                    self.out_dir_edit.text(),
+                    out_dir,
                     f"{base_name}_{task.preset_name}.{output_format}"
                 )
                 self.status_updated.emit(task.file_path, self.tr("正在压制音频"), -1, 'blue', 0)
@@ -528,13 +625,11 @@ class BatchTTS(QWidget):
         non_empty_lines = [line for line in lines if line.strip()]
         return '\n'.join(non_empty_lines)
 
-    def _synthesize_segment(self, text: str) -> Optional[bytes]:
+    def _synthesize_segment(self, text: str, preset_name: str, base_url: str) -> Optional[bytes]:
         if not self.processing:  # Check if stopped
             return None
 
-        base_url = self.url_edit.text().rstrip('/')
-        preset_name = self.preset_combo.currentText()
-        preset_config = self.config_manager.get_value('presets', {}).get(preset_name, {})
+        preset_config = (self.config_manager.get_value('presets', {}) or {}).get(preset_name, {})
 
         def is_prompt_required_model(model_path):
             PROMPT_REQUIRED_VERSIONS = {'SoVITS_weights_v3', 'SoVITS_weights_v4'}
@@ -565,24 +660,37 @@ class BatchTTS(QWidget):
             'streaming_mode': False,
         }
 
-        for _ in range(3):  # Retry 3 times
+        last_error = None
+        for _ in range(3):  # Retry transient failures only (timeouts / 5xx / 连接错误)
             if not self.processing:
                 return None
             try:
-                response = requests.post(f"{base_url}/tts", json=params)
-
-                if response.status_code == 200:
-                    return response.content
-                elif response.status_code == 400:
-                    error = response.json()
-                    raise Exception(self.tr("API错误: {}").format(error))
-
-            except Exception as e:
-                if not self.processing:  # Check if stopped
-                    return None
-                print(self.tr("合成尝试失败: {}").format(str(e)))
+                # 没有 timeout 的 POST 一旦后端卡住, 工作线程就永远挂着
+                response = requests.post(f"{base_url}/tts", json=params, timeout=(5.0, 600.0))
+            except requests.exceptions.RequestException as e:
+                last_error = str(e)
+                print(self.tr("合成尝试失败: {}").format(last_error))
                 time.sleep(1)
+                continue
 
+            if response.status_code == 200:
+                return response.content
+
+            if response.status_code == 400:
+                # 400 = 参数/预设问题 (例如 ref_audio_path 为空), 重试不会变好, 直接把原因抛给用户
+                try:
+                    detail = response.json()
+                except Exception:
+                    detail = response.text[:500]
+                raise ApiError(self.tr(
+                    "引擎拒绝了请求（400）。通常是预设里的参考音频/参考文本不对:\n{}").format(detail))
+
+            last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+            print(self.tr("合成尝试失败: {}").format(last_error))
+            time.sleep(1)
+
+        if last_error:
+            raise ApiError(self.tr("连续 3 次请求失败: {}").format(last_error))
         return None
 
     def _merge_audio_files(self, cache_dir: str, output_file: str, format: str):

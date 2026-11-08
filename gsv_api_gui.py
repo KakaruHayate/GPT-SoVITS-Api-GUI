@@ -166,6 +166,9 @@ class GSVApiGUI(QWidget):
         self.batch_tts_tab = BatchTTS()
         self.tab_widget.addTab(self.batch_tts_tab, self.tr("批量合成"))
         self.set_tab_background(self.batch_tts_tab, ":/GAG_tools/images/GAG_background.png")
+        # "去配置预设" 按钮: 跳回语音合成页去配参考音频并保存预设
+        self.batch_tts_tab.goto_preset_requested.connect(
+            lambda: self.tab_widget.setCurrentWidget(self.tts_gui_tab))
 
         self.setLayout(main_layout)
 
